@@ -395,7 +395,20 @@ This project could investigate:
 
 ## Project Status
 
-**Status:** Planning / Research
+**Status:** Foundational backbone implemented; working prototype in active development.
+
+The core package establishes typed telemetry, rider, evidence, and analysis models plus
+an auditable cycling-physics function. The implementation intentionally keeps screening
+results separate from adjudication: every result is phrased as a review recommendation.
+
+### Development setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev,api,fit]'
+pytest
+```
 
 Initial development should focus on FIT-file parsing, trajectory reconstruction, and detecting suspicious power-to-speed relationships.
 
