@@ -349,16 +349,22 @@
         <dl class="details">
           ${detail('Time window', `${formatTime(segment.start_time)}–${formatTime(segment.end_time)}`)}
           ${detail('Location', `${location}${courseDistance}`, true)}
-          ${detail('Nearest rider', escapeHtml(segment.nearest_rider_id || 'Not available'), true)}
-          ${detail('Mean separation', separation)}
-          ${detail('Mean speed', `${(Number(segment.average_speed_mps) * 3.6).toFixed(1)} km/h`)}
-          ${detail('Power / matched reference', `${power}${expected}`)}
+          ${detail('Rider ahead', riderSummary(segment.rider_ahead_id, segment.rider_ahead_speed_mps, segment.rider_ahead_power_w), true)}
+          ${detail('Rider behind', riderSummary(segment.rider_behind_id || segment.rider_id, segment.rider_behind_speed_mps || segment.average_speed_mps, segment.rider_behind_power_w ?? segment.average_power_w), true)}
+          ${detail('Distance between riders', separation)}
+          ${detail('Behind rider power / matched reference', `${power}${expected}`)}
         </dl>
         <p class="evidence"><strong>Why this was flagged:</strong> ${segment.evidence.notes.map(escapeHtml).join(' ')}</p>
       </article>`;
     }
 
     function metric(value, label) { return `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`; }
+    function riderSummary(id, speed, power) {
+      if (!id) return 'Not available';
+      const speedText = speed == null ? 'speed unavailable' : `${(Number(speed) * 3.6).toFixed(1)} km/h`;
+      const powerText = power == null ? 'power unavailable' : `${Number(power).toFixed(0)} W`;
+      return `${escapeHtml(id)} · ${escapeHtml(speedText)} · ${escapeHtml(powerText)}`;
+    }
     function detail(label, value, trusted = false) { return `<div class="detail"><dt>${label}</dt><dd>${trusted ? value : escapeHtml(value)}</dd></div>`; }
     function clampPercent(value) { return Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100); }
     function formatTime(value) { return new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
