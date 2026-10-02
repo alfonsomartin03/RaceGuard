@@ -79,8 +79,10 @@ class SuspiciousSegment:
     average_speed_mps: float | None = None
     average_power_w: float | None = None
     expected_power_w: float | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    course_distance_m: float | None = None
 
     @property
     def duration_seconds(self) -> float:
         return (self.end_time - self.start_time).total_seconds()
-

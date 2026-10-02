@@ -7,7 +7,7 @@ from importlib.resources import files
 from pathlib import Path
 
 try:
-    from fastapi import FastAPI, File, HTTPException, UploadFile
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
     from fastapi.responses import HTMLResponse
 except ImportError as exc:  # pragma: no cover - depends on optional installation
     raise RuntimeError("API support requires: pip install -e '.[api]'") from exc
@@ -34,11 +34,15 @@ def dashboard() -> str:
 
 
 @app.post("/api/analyze")
-async def analyze_upload(file: UploadFile = File(...), rider_id: str | None = None) -> dict:
+async def analyze_upload(
+    file: UploadFile = File(...), rider_id: str | None = Form(default=None)
+) -> dict:
     suffix = Path(file.filename or "telemetry.csv").suffix.lower()
     if suffix not in {".csv", ".fit"}:
         raise HTTPException(400, "Upload a .csv or .fit file")
     content = await file.read()
+    if not content:
+        raise HTTPException(400, "The uploaded file is empty")
     if len(content) > 25 * 1024 * 1024:
         raise HTTPException(413, "File exceeds the 25 MB prototype limit")
     temporary_path: Path | None = None
@@ -58,4 +62,3 @@ async def analyze_upload(file: UploadFile = File(...), rider_id: str | None = No
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
-

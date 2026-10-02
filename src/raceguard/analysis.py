@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from statistics import fmean
@@ -20,6 +21,18 @@ class AnalysisResult:
     ended_at: datetime | None
     segments: tuple[SuspiciousSegment, ...]
     warnings: tuple[str, ...] = ()
+
+    @property
+    def is_suspicious(self) -> bool:
+        """Whether at least one segment crossed the configured review threshold."""
+
+        return bool(self.segments)
+
+    @property
+    def confidence(self) -> float:
+        """Highest explainable review score in the activity."""
+
+        return max((segment.score for segment in self.segments), default=0.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +58,10 @@ def analyze(
     if all(point.power_w is None for point in points):
         warnings.append("Power telemetry is absent; review scores rely on proximity and speed.")
     if len(riders) == 1:
-        warnings.append("Only one rider is present; proximity evidence is unavailable.")
+        warnings.append(
+            "Only one rider is present; screening uses sustained power-to-speed anomalies "
+            "without rider-proximity evidence."
+        )
 
     by_time: dict[datetime, list[TelemetryPoint]] = defaultdict(list)
     for point in points:
@@ -150,12 +166,16 @@ def _build_segment(
     speed_score = min(1.0, average_speed / 15.0)
     telemetry_confidence = 0.45 + (0.25 if separations else 0) + (0.25 if powers else 0)
     telemetry_confidence = min(1.0, telemetry_confidence)
-    score = (
-        0.35 * proximity_score
-        + 0.20 * duration_score
-        + 0.30 * power_score
-        + 0.15 * speed_score
-    ) * telemetry_confidence
+    weighted_evidence = 0.20 * duration_score + 0.15 * speed_score
+    available_weight = 0.35
+    if separations:
+        weighted_evidence += 0.35 * proximity_score
+        available_weight += 0.35
+    if powers:
+        weighted_evidence += 0.30 * power_score
+        available_weight += 0.30
+    # Missing proximity must reduce confidence, not make a single-rider flag impossible.
+    score = (weighted_evidence / available_weight) * telemetry_confidence
     notes: list[str] = []
     if separations:
         notes.append("Sustained rider proximity was detected from synchronized GPS samples.")
@@ -181,5 +201,12 @@ def _build_segment(
         average_speed_mps=round(average_speed, 2),
         average_power_w=round(fmean(powers), 1) if powers else None,
         expected_power_w=round(fmean(expected), 1) if expected else None,
+        latitude=round(fmean(item.point.latitude for item in run), 6),
+        longitude=round(fmean(item.point.longitude for item in run), 6),
+        course_distance_m=_mean_optional(item.point.distance_m for item in run),
     )
 
+
+def _mean_optional(values: Iterable[float | None]) -> float | None:
+    available = [value for value in values if value is not None]
+    return round(fmean(available), 1) if available else None

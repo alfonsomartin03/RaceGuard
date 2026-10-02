@@ -88,34 +88,38 @@ def load_fit(path: str | Path, rider_id: str) -> list[TelemetryPoint]:
 
     try:
         from fitparse import FitFile  # type: ignore[import-not-found]
+        from fitparse.utils import FitParseError  # type: ignore[import-not-found]
     except ImportError as exc:
         raise TelemetryError("FIT support requires: pip install -e '.[fit]'") from exc
 
     points: list[TelemetryPoint] = []
-    for record in FitFile(str(path)).get_messages("record"):
-        values = record.get_values()
-        if not all(key in values for key in ("timestamp", "position_lat", "position_long")):
-            continue
-        speed = values.get("enhanced_speed", values.get("speed"))
-        if speed is None:
-            continue
-        timestamp = values["timestamp"]
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        points.append(
-            TelemetryPoint(
-                rider_id=rider_id,
-                timestamp=timestamp.astimezone(timezone.utc),
-                latitude=float(values["position_lat"]) * (180.0 / 2**31),
-                longitude=float(values["position_long"]) * (180.0 / 2**31),
-                speed_mps=float(speed),
-                power_w=_as_float(values.get("power")),
-                elevation_m=_as_float(values.get("enhanced_altitude", values.get("altitude"))),
-                cadence_rpm=_as_float(values.get("cadence")),
-                heart_rate_bpm=_as_float(values.get("heart_rate")),
-                distance_m=_as_float(values.get("distance")),
+    try:
+        for record in FitFile(str(path)).get_messages("record"):
+            values = record.get_values()
+            if not all(key in values for key in ("timestamp", "position_lat", "position_long")):
+                continue
+            speed = values.get("enhanced_speed", values.get("speed"))
+            if speed is None:
+                continue
+            timestamp = values["timestamp"]
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            points.append(
+                TelemetryPoint(
+                    rider_id=rider_id,
+                    timestamp=timestamp.astimezone(timezone.utc),
+                    latitude=float(values["position_lat"]) * (180.0 / 2**31),
+                    longitude=float(values["position_long"]) * (180.0 / 2**31),
+                    speed_mps=float(speed),
+                    power_w=_as_float(values.get("power")),
+                    elevation_m=_as_float(values.get("enhanced_altitude", values.get("altitude"))),
+                    cadence_rpm=_as_float(values.get("cadence")),
+                    heart_rate_bpm=_as_float(values.get("heart_rate")),
+                    distance_m=_as_float(values.get("distance")),
+                )
             )
-        )
+    except (FitParseError, OSError, TypeError, ValueError) as exc:
+        raise TelemetryError(f"invalid FIT file: {exc}") from exc
     return clean_points(points)
 
 
@@ -144,4 +148,3 @@ def haversine_m(a: TelemetryPoint, b: TelemetryPoint) -> float:
     dlon = math.radians(b.longitude - a.longitude)
     h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 2 * EARTH_RADIUS_M * math.asin(math.sqrt(h))
-

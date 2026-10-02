@@ -417,6 +417,10 @@ multi-rider CSV files and individual FIT activities, validates telemetry, estima
 power demand, finds sustained synchronized GPS proximity, and produces explainable review
 flags. It deliberately does not issue penalties or label a rider as having cheated.
 
+A single FIT activity can be flagged from a sustained mismatch between measured power and
+the estimated solo power required for its speed. Multi-rider uploads add independent GPS
+proximity evidence and therefore support a higher-confidence assessment.
+
 ### Analyze from the command line
 
 The included sample contains two nearby riders and can be run without third-party packages:
@@ -437,7 +441,10 @@ python -m pip install -e '.[api]'
 uvicorn raceguard.api:app --reload
 ```
 
-Open `http://127.0.0.1:8000`, upload telemetry, and inspect the contributing evidence.
+Open `http://127.0.0.1:8000`, upload telemetry, and inspect the activity assessment,
+confidence score, review locations, and contributing evidence. CSV files can contain one or
+more riders. FIT files are analyzed as a single rider and the console prompts for a rider ID.
+Uploaded files are processed locally in a temporary file and are deleted after analysis.
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
 
 FIT input requires the optional dependency and a rider identifier:
@@ -451,6 +458,8 @@ raceguard activity.fit --rider-id 142
 
 - Multi-rider proximity currently requires samples with matching UTC timestamps.
 - The physics model uses a constant configured wind value and does not infer wind direction.
+- Segment coordinates and timestamps are included in the result contract so a future weather
+  provider can supply local wind speed and direction without changing the upload workflow.
 - Consumer GPS uncertainty can be similar to the distances under review.
 - Scores are heuristic review priorities and require validation against controlled trials.
 - Data is processed in memory; persistence, authentication, and race administration are not
