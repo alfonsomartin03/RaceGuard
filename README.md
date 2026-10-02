@@ -440,6 +440,14 @@ power model also includes acceleration or deceleration measured across the rolli
 Candidates must exceed both a 45 W absolute deficit and a 15% proportional deficit, which
 prevents small sensor or model errors from being amplified merely because the rider is fast.
 
+RaceGuard also performs within-activity section matching. Stable ten-second sections are
+compared with non-adjacent earlier or later sections from the same rider when speed is within
+0.75 m/s, gradient within 0.75 percentage points, and acceleration within 0.20 m/s². The
+median power of at least two comparable sections becomes a rider-specific reference. A lower
+power section must be a robust statistical outlier, exceed the absolute and proportional
+thresholds, and persist long enough to become a review location. Repeated occurrences are
+returned as separate chronological flags. This comparison is independent of assumed CdA.
+
 ### Analyze from the command line
 
 The included sample contains two nearby riders and can be run without third-party packages:

@@ -152,6 +152,60 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertFalse(result.is_suspicious)
 
+    def test_repeated_low_power_sections_are_compared_with_similar_sections(self) -> None:
+        profile = RiderProfile("repeat", cda_m2=0.25)
+        normal_power = expected_solo_power(12.0, 0.01, profile)
+        filler_power = expected_solo_power(9.0, 0.03, profile)
+        phases = [
+            (40, 12.0, 0.01, normal_power),
+            (40, 9.0, 0.03, filler_power),
+            (40, 12.0, 0.01, normal_power - 100),
+            (40, 9.0, 0.03, filler_power),
+            (40, 12.0, 0.01, normal_power),
+            (40, 9.0, 0.03, filler_power),
+            (40, 12.0, 0.01, normal_power - 100),
+            (40, 9.0, 0.03, filler_power),
+            (40, 12.0, 0.01, normal_power),
+        ]
+        points = self._phased_activity(profile.rider_id, phases)
+
+        result = analyze(points)
+
+        contextual = [
+            segment
+            for segment in result.segments
+            if any("non-adjacent" in note for note in segment.evidence.notes)
+        ]
+        self.assertGreaterEqual(len(contextual), 2)
+        self.assertEqual(
+            [segment.start_time for segment in contextual],
+            sorted(segment.start_time for segment in contextual),
+        )
+
+    @staticmethod
+    def _phased_activity(
+        rider_id: str, phases: list[tuple[int, float, float, float]]
+    ) -> list[TelemetryPoint]:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        points: list[TelemetryPoint] = []
+        sample_index = 0
+        for duration, speed, gradient, power in phases:
+            for _ in range(duration):
+                points.append(
+                    TelemetryPoint(
+                        rider_id=rider_id,
+                        timestamp=started + timedelta(seconds=sample_index),
+                        latitude=40.0 + sample_index * 0.0001,
+                        longitude=-74.0,
+                        speed_mps=speed,
+                        power_w=power,
+                        cadence_rpm=90.0,
+                        gradient=gradient,
+                    )
+                )
+                sample_index += 1
+        return points
+
     @staticmethod
     def _activity_points(
         profile: RiderProfile, outlier_samples: int, baseline_speed: float = 12.0

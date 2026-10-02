@@ -60,6 +60,12 @@ class AnalysisConfig:
     soft_pedaling_fraction: float = 0.35
     minimum_pedaling_cadence_rpm: float = 30.0
     minimum_gradient_distance_m: float = 20.0
+    comparison_section_seconds: float = 10.0
+    comparison_exclusion_seconds: float = 30.0
+    similar_speed_tolerance_mps: float = 0.75
+    similar_gradient_tolerance: float = 0.0075
+    similar_acceleration_tolerance_mps2: float = 0.20
+    minimum_comparison_sections: int = 2
 
 
 @dataclass(frozen=True, slots=True)

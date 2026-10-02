@@ -45,6 +45,8 @@ class _Candidate:
     deficit_w: float
     power_outlier_score: float
     adaptive_baseline: bool
+    contextual_comparison: bool
+    comparison_sections: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +64,25 @@ class _RollingSignal:
     acceleration_mps2: float
     power_w: float | None
     stable_pedaling: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextComparison:
+    reference_power_w: float
+    deficit_w: float
+    outlier_score: float
+    peer_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _Section:
+    keys: tuple[tuple[str, datetime], ...]
+    start_time: datetime
+    end_time: datetime
+    speed_mps: float
+    gradient: float
+    acceleration_mps2: float
+    power_w: float
 
 
 def analyze(
@@ -84,6 +105,7 @@ def analyze(
         )
 
     rolling_signals = _build_rolling_signals(points, config)
+    context_comparisons = _build_context_comparisons(points, rolling_signals, config)
     baselines = _build_power_baselines(points, profiles, config, rolling_signals)
     calibrated = [rider_id for rider_id, baseline in baselines.items() if baseline.adaptive]
     if calibrated:
@@ -102,6 +124,7 @@ def analyze(
         samples = by_time[timestamp]
         for point in samples:
             signal = rolling_signals[(point.rider_id, point.timestamp)]
+            comparison = context_comparisons.get((point.rider_id, point.timestamp))
             nearest_id: str | None = None
             nearest_distance: float | None = None
             for other in samples:
@@ -121,38 +144,59 @@ def analyze(
                 headwind_mps=config.wind_speed_mps,
                 acceleration_mps2=signal.acceleration_mps2,
             ) if signal.stable_pedaling and signal.power_w is not None else None
-            deficit = max(0.0, (expected or 0.0) - (signal.power_w or 0.0))
+            physics_deficit = max(0.0, (expected or 0.0) - (signal.power_w or 0.0))
             outlier_z = (
-                (deficit - baseline.residual_center_w) / baseline.residual_scale_w
+                (physics_deficit - baseline.residual_center_w) / baseline.residual_scale_w
                 if baseline.adaptive and baseline.residual_scale_w > 0
                 else 0.0
             )
-            power_outlier_score = (
+            physics_outlier_score = (
                 min(1.0, max(0.0, outlier_z) / 4.0)
                 if baseline.adaptive
-                else min(1.0, deficit / max(config.minimum_power_deficit_w * 2, 1))
+                else min(1.0, physics_deficit / max(config.minimum_power_deficit_w * 2, 1))
             )
             close = nearest_distance is not None and nearest_distance <= config.proximity_threshold_m
-            anomalous = (
+            physics_anomalous = (
                 expected is not None
                 and signal.speed_mps >= config.minimum_speed_mps
-                and deficit >= config.minimum_power_deficit_w
-                and deficit / max(expected, 1.0) >= config.minimum_power_deficit_ratio
+                and physics_deficit >= config.minimum_power_deficit_w
+                and physics_deficit / max(expected, 1.0) >= config.minimum_power_deficit_ratio
                 and (
                     not baseline.adaptive
                     or outlier_z >= config.outlier_z_threshold
                 )
             )
+            contextual_anomalous = (
+                comparison is not None
+                and comparison.deficit_w >= config.minimum_power_deficit_w
+                and comparison.deficit_w / max(comparison.reference_power_w, 1.0)
+                >= config.minimum_power_deficit_ratio
+                and comparison.outlier_score
+                >= min(1.0, config.outlier_z_threshold / 4.0)
+            )
+            anomalous = physics_anomalous or contextual_anomalous
             if close or anomalous:
+                reported_expected = (
+                    comparison.reference_power_w if contextual_anomalous else expected
+                )
+                reported_deficit = (
+                    comparison.deficit_w if contextual_anomalous else physics_deficit
+                )
+                power_outlier_score = max(
+                    physics_outlier_score if physics_anomalous else 0.0,
+                    comparison.outlier_score if contextual_anomalous else 0.0,
+                )
                 candidates[(point.rider_id, nearest_id if close else None)].append(
                     _Candidate(
                         point,
                         nearest_id if close else None,
                         nearest_distance if close else None,
-                        expected,
-                        deficit,
+                        reported_expected,
+                        reported_deficit,
                         power_outlier_score,
                         baseline.adaptive,
+                        contextual_anomalous,
+                        comparison.peer_count if comparison is not None else 0,
                     )
                 )
 
@@ -236,7 +280,15 @@ def _build_segment(
     if separations:
         notes.append("Sustained rider proximity was detected from synchronized GPS samples.")
     if average_deficit >= config.minimum_power_deficit_w:
-        if any(item.adaptive_baseline for item in run):
+        contextual_items = [item for item in run if item.contextual_comparison]
+        if contextual_items:
+            peer_count = max(item.comparison_sections for item in contextual_items)
+            notes.append(
+                "Power was materially lower than "
+                f"{peer_count} non-adjacent section{'s' if peer_count != 1 else ''} "
+                "at similar speed, gradient, and acceleration."
+            )
+        elif any(item.adaptive_baseline for item in run):
             notes.append(
                 "Power-to-speed efficiency was a sustained outlier from this rider's "
                 "gradient-adjusted activity baseline."
@@ -272,6 +324,96 @@ def _build_segment(
 def _mean_optional(values: Iterable[float | None]) -> float | None:
     available = [value for value in values if value is not None]
     return round(fmean(available), 1) if available else None
+
+
+def _build_context_comparisons(
+    points: list[TelemetryPoint],
+    rolling_signals: dict[tuple[str, datetime], _RollingSignal],
+    config: AnalysisConfig,
+) -> dict[tuple[str, datetime], _ContextComparison]:
+    """Compare non-adjacent sections under similar observed riding conditions."""
+
+    by_rider: dict[str, list[TelemetryPoint]] = defaultdict(list)
+    for point in points:
+        by_rider[point.rider_id].append(point)
+
+    comparisons: dict[tuple[str, datetime], _ContextComparison] = {}
+    for rider_points in by_rider.values():
+        sections: list[_Section] = []
+        current: list[tuple[TelemetryPoint, _RollingSignal]] = []
+
+        for point in sorted(rider_points, key=lambda item: item.timestamp):
+            signal = rolling_signals[(point.rider_id, point.timestamp)]
+            if not signal.stable_pedaling or signal.power_w is None:
+                _flush_context_section(current, sections)
+                continue
+            if current:
+                elapsed = (point.timestamp - current[0][0].timestamp).total_seconds()
+                gap = (point.timestamp - current[-1][0].timestamp).total_seconds()
+                if elapsed >= config.comparison_section_seconds or gap > config.maximum_sample_gap_seconds:
+                    _flush_context_section(current, sections)
+            current.append((point, signal))
+        _flush_context_section(current, sections)
+
+        for section in sections:
+            peers = [
+                other
+                for other in sections
+                if other is not section
+                and _section_gap_seconds(section, other) >= config.comparison_exclusion_seconds
+                and abs(section.speed_mps - other.speed_mps)
+                <= config.similar_speed_tolerance_mps
+                and abs(section.gradient - other.gradient)
+                <= config.similar_gradient_tolerance
+                and abs(section.acceleration_mps2 - other.acceleration_mps2)
+                <= config.similar_acceleration_tolerance_mps2
+            ]
+            if len(peers) < config.minimum_comparison_sections:
+                continue
+            peer_powers = [peer.power_w for peer in peers]
+            reference_power = median(peer_powers)
+            peer_mad = median(abs(power - reference_power) for power in peer_powers)
+            deficit = max(0.0, reference_power - section.power_w)
+            robust_scale = max(15.0, 1.4826 * peer_mad)
+            comparison = _ContextComparison(
+                reference_power_w=reference_power,
+                deficit_w=deficit,
+                outlier_score=min(1.0, deficit / robust_scale / 4.0),
+                peer_count=len(peers),
+            )
+            for key in section.keys:
+                comparisons[key] = comparison
+    return comparisons
+
+
+def _flush_context_section(
+    current: list[tuple[TelemetryPoint, _RollingSignal]], sections: list[_Section]
+) -> None:
+    if len(current) >= 3:
+        sections.append(
+            _Section(
+                keys=tuple((point.rider_id, point.timestamp) for point, _ in current),
+                start_time=current[0][0].timestamp,
+                end_time=current[-1][0].timestamp,
+                speed_mps=fmean(signal.speed_mps for _, signal in current),
+                gradient=fmean(signal.gradient for _, signal in current),
+                acceleration_mps2=fmean(signal.acceleration_mps2 for _, signal in current),
+                power_w=fmean(
+                    signal.power_w
+                    for _, signal in current
+                    if signal.power_w is not None
+                ),
+            )
+        )
+    current.clear()
+
+
+def _section_gap_seconds(first: _Section, second: _Section) -> float:
+    if first.end_time < second.start_time:
+        return (second.start_time - first.end_time).total_seconds()
+    if second.end_time < first.start_time:
+        return (first.start_time - second.end_time).total_seconds()
+    return 0.0
 
 
 def _build_power_baselines(
