@@ -79,6 +79,16 @@ class _Candidate:
     power: _PowerEvidence | None = None
     leader_id: str | None = None
     separation_m: float | None = None
+    leader_speed_mps: float | None = None
+    leader_power_w: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RiderRelationship:
+    rider_ahead_id: str
+    separation_m: float
+    rider_ahead_speed_mps: float
+    rider_ahead_power_w: float | None
 
 
 def analyze(
@@ -135,8 +145,10 @@ def analyze(
                     _Candidate(
                         frame=frame,
                         power=power,
-                        leader_id=lead[0] if lead else None,
-                        separation_m=lead[1] if lead else None,
+                        leader_id=lead.rider_ahead_id if lead else None,
+                        separation_m=lead.separation_m if lead else None,
+                        leader_speed_mps=lead.rider_ahead_speed_mps if lead else None,
+                        leader_power_w=lead.rider_ahead_power_w if lead else None,
                     )
                 )
         for run in _runs(candidates, config.maximum_sample_gap_seconds):
@@ -193,10 +205,14 @@ def _build_frames(points: list[TelemetryPoint], config: AnalysisConfig) -> list[
         derived = _derived_grade(window, config)
         if abs(grade) < 0.0001 and derived is not None:
             grade = derived
-        direction_left = bisect_left(timestamps, point.timestamp - timedelta(seconds=8))
-        direction_right = bisect_right(timestamps, point.timestamp + timedelta(seconds=8))
+        direction_left = bisect_left(
+            timestamps, point.timestamp - timedelta(seconds=config.heading_window_seconds)
+        )
+        direction_right = bisect_right(
+            timestamps, point.timestamp + timedelta(seconds=config.heading_window_seconds)
+        )
         direction_points = ordered[direction_left:direction_right]
-        heading = _bearing(direction_points[0], direction_points[-1]) if len(direction_points) > 1 else None
+        heading = _stable_heading(direction_points, config)
         transition_left = bisect_left(
             timestamps, point.timestamp - timedelta(seconds=config.pedaling_transition_seconds)
         )
@@ -240,6 +256,44 @@ def _bearing(first: TelemetryPoint, last: TelemetryPoint) -> float | None:
     if math.hypot(north, east) < 1e-9:
         return None
     return math.degrees(math.atan2(east, north)) % 360
+
+
+def _stable_heading(
+    points: list[TelemetryPoint], config: AnalysisConfig
+) -> float | None:
+    """Return a course heading only when GPS movement is coherent enough to trust.
+
+    Successive position vectors are combined instead of relying on a single pair
+    of endpoints. The resultant/path ratio rejects stationary GPS wander, sharp
+    turns, and turnarounds where an ahead/behind label would be ambiguous.
+    """
+    if len(points) < 2:
+        return None
+    north_total = 0.0
+    east_total = 0.0
+    path_distance = 0.0
+    for first, last in pairwise(points):
+        elapsed = (last.timestamp - first.timestamp).total_seconds()
+        if elapsed <= 0 or elapsed > config.maximum_sample_gap_seconds:
+            return None
+        north = math.radians(last.latitude - first.latitude) * 6_371_008.8
+        east = (
+            math.radians(last.longitude - first.longitude)
+            * 6_371_008.8
+            * math.cos(math.radians((first.latitude + last.latitude) / 2))
+        )
+        distance = math.hypot(north, east)
+        north_total += north
+        east_total += east
+        path_distance += distance
+    displacement = math.hypot(north_total, east_total)
+    if (
+        path_distance < config.minimum_heading_displacement_m
+        or displacement < config.minimum_heading_displacement_m
+        or displacement / path_distance < config.minimum_heading_consistency
+    ):
+        return None
+    return math.degrees(math.atan2(east_total, north_total)) % 360
 
 
 def _angle_difference(first: float, second: float) -> float:
@@ -375,19 +429,19 @@ def _section_gap(first: _Section, second: _Section) -> float:
 
 def _trailing_evidence(
     frames_by_rider: dict[str, list[_Frame]], config: AnalysisConfig
-) -> dict[tuple[str, datetime], tuple[str, float]]:
+) -> dict[tuple[str, datetime], _RiderRelationship]:
     if len(frames_by_rider) < 2:
         return {}
     timestamps = {
         rider_id: [frame.point.timestamp for frame in frames]
         for rider_id, frames in frames_by_rider.items()
     }
-    trailing: dict[tuple[str, datetime], tuple[str, float]] = {}
+    possible: dict[tuple[str, datetime], _RiderRelationship] = {}
     for rider_id, frames in frames_by_rider.items():
         for frame in frames:
             if frame.heading_deg is None or frame.speed_mps < config.minimum_speed_mps:
                 continue
-            best: tuple[str, float] | None = None
+            best: _RiderRelationship | None = None
             for other_id, others in frames_by_rider.items():
                 if other_id == rider_id:
                     continue
@@ -398,7 +452,11 @@ def _trailing_evidence(
                     other = others[candidate_index]
                     if abs((other.point.timestamp - frame.point.timestamp).total_seconds()) > 2:
                         continue
-                    if other.heading_deg is None or _angle_difference(frame.heading_deg, other.heading_deg) > 20:
+                    if (
+                        other.heading_deg is None
+                        or _angle_difference(frame.heading_deg, other.heading_deg)
+                        > config.maximum_pair_heading_difference_deg
+                    ):
                         continue
                     if abs(frame.speed_mps - other.speed_mps) > 2:
                         continue
@@ -409,11 +467,54 @@ def _trailing_evidence(
                     lateral = abs(east * math.cos(angle) - north * math.sin(angle))
                     if 2 <= ahead <= config.proximity_threshold_m and lateral <= 5:
                         separation = math.hypot(ahead, lateral)
-                        if best is None or separation < best[1]:
-                            best = (other_id, separation)
+                        if best is None or separation < best.separation_m:
+                            best = _RiderRelationship(
+                                rider_ahead_id=other_id,
+                                separation_m=separation,
+                                rider_ahead_speed_mps=other.speed_mps,
+                                rider_ahead_power_w=other.power_w,
+                            )
             if best is not None:
-                trailing[(rider_id, frame.point.timestamp)] = best
-    return trailing
+                possible[(rider_id, frame.point.timestamp)] = best
+
+    # GPS can briefly place riders close during a legal pass or because of normal
+    # position error. Keep only an unchanged ahead/behind relationship that lasts
+    # longer than the configured confirmation window.
+    confirmed: dict[tuple[str, datetime], _RiderRelationship] = {}
+    for rider_id, frames in frames_by_rider.items():
+        run: list[tuple[datetime, _RiderRelationship]] = []
+        for frame in frames:
+            key = (rider_id, frame.point.timestamp)
+            relationship = possible.get(key)
+            continues = bool(
+                run
+                and relationship is not None
+                and relationship.rider_ahead_id == run[-1][1].rider_ahead_id
+                and (frame.point.timestamp - run[-1][0]).total_seconds()
+                <= config.maximum_sample_gap_seconds
+            )
+            if not continues:
+                _confirm_relationship_run(run, rider_id, confirmed, config)
+                run = []
+            if relationship is not None:
+                run.append((frame.point.timestamp, relationship))
+        _confirm_relationship_run(run, rider_id, confirmed, config)
+    return confirmed
+
+
+def _confirm_relationship_run(
+    run: list[tuple[datetime, _RiderRelationship]],
+    rider_id: str,
+    confirmed: dict[tuple[str, datetime], _RiderRelationship],
+    config: AnalysisConfig,
+) -> None:
+    if not run:
+        return
+    observed_seconds = (run[-1][0] - run[0][0]).total_seconds()
+    if observed_seconds <= config.minimum_proximity_seconds:
+        return
+    for timestamp, relationship in run:
+        confirmed[(rider_id, timestamp)] = relationship
 
 
 def _runs(candidates: list[_Candidate], max_gap: float) -> list[list[_Candidate]]:
@@ -443,11 +544,16 @@ def _segment_from_run(
     separation = fmean(item.separation_m for item in trailing if item.separation_m is not None) if trailing else None
     reference = fmean(item.reference_w for item in power) if power else None
     measured = [item.frame.power_w for item in run if item.frame.power_w is not None]
+    leader_speeds = [item.leader_speed_mps for item in trailing if item.leader_speed_mps is not None]
+    leader_powers = [item.leader_power_w for item in trailing if item.leader_power_w is not None]
     power_score = min(1.0, fmean(item.deficit_w / item.reference_w for item in power) / 0.35) if power else 0.0
     proximity_score = max(0.0, 1 - separation / config.proximity_threshold_m) if separation is not None else 0.0
     duration_score = min(1.0, duration / 45)
     speed_score = min(1.0, fmean(item.frame.speed_mps for item in run) / 15)
     telemetry_confidence = min(0.95, 0.5 + (0.2 if power else 0) + (0.2 if trailing else 0))
+    leader_ids = [item.leader_id for item in trailing if item.leader_id is not None]
+    leader = max(set(leader_ids), key=leader_ids.count) if leader_ids else None
+    headings = [item.frame.heading_deg for item in run if item.frame.heading_deg is not None]
     # Heuristic review priority, not a posterior probability of drafting.
     score = min(0.95, 0.55 + 0.14 * duration_score + 0.15 * power_score + 0.12 * proximity_score + (0.08 if power and trailing else 0))
     notes: list[str] = []
@@ -460,10 +566,12 @@ def _segment_from_run(
         if not all(item.matched_speed for item in power):
             notes.append("Some comparison sections required speed normalization, which increases wind uncertainty.")
     if trailing:
-        notes.append("Synchronized GPS places this rider behind another rider for a sustained interval; GPS distance is approximate.")
+        notes.append(
+            f"Synchronized GPS places rider {rider_id} behind rider "
+            f"{leader} "
+            f"for more than {config.minimum_proximity_seconds:.0f} seconds; GPS distance is approximate."
+        )
     notes.append("Wind, riding position, road surface, and sensor error can produce similar patterns.")
-    leader_ids = [item.leader_id for item in trailing if item.leader_id is not None]
-    leader = max(set(leader_ids), key=leader_ids.count) if leader_ids else None
     distances = [item.frame.point.distance_m for item in run if item.frame.point.distance_m is not None]
     return SuspiciousSegment(
         rider_id=rider_id,
@@ -479,7 +587,16 @@ def _segment_from_run(
             notes=tuple(notes),
         ),
         nearest_rider_id=leader,
+        rider_ahead_id=leader,
+        rider_behind_id=rider_id if leader is not None else None,
         average_separation_m=round(separation, 1) if separation is not None else None,
+        rider_ahead_speed_mps=round(fmean(leader_speeds), 2) if leader_speeds else None,
+        rider_ahead_power_w=round(fmean(leader_powers), 1) if leader_powers else None,
+        rider_behind_speed_mps=round(fmean(item.frame.speed_mps for item in trailing), 2) if trailing else None,
+        rider_behind_power_w=round(
+            fmean(item.frame.power_w for item in trailing if item.frame.power_w is not None), 1
+        ) if any(item.frame.power_w is not None for item in trailing) else None,
+        direction_heading_deg=round(_circular_mean(headings), 1) if headings else None,
         average_speed_mps=round(fmean(item.frame.speed_mps for item in run), 2),
         average_power_w=round(fmean(measured), 1) if measured else None,
         expected_power_w=round(reference, 1) if reference is not None else None,

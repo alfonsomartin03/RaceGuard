@@ -20,7 +20,7 @@ def result_to_dict(result: AnalysisResult) -> dict[str, Any]:
             "is_suspicious": result.is_suspicious,
             "confidence": result.confidence,
             "evidence_score": result.evidence_score,
-            "model": "matched-sections-v2",
+            "model": "multi-rider-position-v3",
             "assessment": "review_recommended" if result.is_suspicious else "no_flags_detected",
         },
         "warnings": list(result.warnings),
@@ -52,8 +52,11 @@ def result_to_text(result: AnalysisResult) -> str:
                 f"{index}. RIDER {segment.rider_id} — REVIEW PRIORITY {segment.score:.0%}",
                 f"   {segment.start_time.isoformat()} to {segment.end_time.isoformat()}",
                 f"   Duration: {segment.duration_seconds:.0f}s | Speed: {(segment.average_speed_mps or 0) * 3.6:.1f} km/h",
-                f"   Nearest rider: {segment.nearest_rider_id or 'unavailable'} | Separation: {_number(segment.average_separation_m, 'm')}",
-                f"   Power: {_number(segment.average_power_w, 'W')} | Matched-section reference: {_number(segment.expected_power_w, 'W')}",
+                f"   Rider ahead: {segment.rider_ahead_id or 'unavailable'} | Speed: {_speed(segment.rider_ahead_speed_mps)} | Power: {_number(segment.rider_ahead_power_w, 'W')}",
+                f"   Rider behind: {segment.rider_behind_id or segment.rider_id} | Speed: {_speed(segment.rider_behind_speed_mps or segment.average_speed_mps)} | Power: {_number(segment.rider_behind_power_w if segment.rider_behind_power_w is not None else segment.average_power_w, 'W')}",
+                f"   Distance between riders: {_number(segment.average_separation_m, 'm')}",
+                f"   Direction of travel: {_heading(segment.direction_heading_deg)}",
+                f"   Matched-section power reference: {_number(segment.expected_power_w, 'W')}",
                 f"   Location: {_location(segment.latitude, segment.longitude, segment.course_distance_m)}",
                 "   Recommendation: review footage, observations, weather, and source telemetry.",
             ]
@@ -63,6 +66,17 @@ def result_to_text(result: AnalysisResult) -> str:
 
 def _number(value: float | None, suffix: str) -> str:
     return f"{value:.1f} {suffix}" if value is not None else "unavailable"
+
+
+def _speed(value: float | None) -> str:
+    return f"{value * 3.6:.1f} km/h" if value is not None else "unavailable"
+
+
+def _heading(value: float | None) -> str:
+    if value is None:
+        return "unavailable"
+    directions = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    return f"{directions[round(value / 45) % 8]} ({value:.0f}°)"
 
 
 def _location(latitude: float | None, longitude: float | None, distance_m: float | None) -> str:

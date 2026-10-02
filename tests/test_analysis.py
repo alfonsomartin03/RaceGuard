@@ -1,9 +1,9 @@
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from raceguard.analysis import analyze
+from raceguard.analysis import _stable_heading, analyze
 from raceguard.ingest import load_csv
-from raceguard.models import RiderProfile, TelemetryPoint
+from raceguard.models import AnalysisConfig, RiderProfile, TelemetryPoint
 from raceguard.physics import expected_solo_power
 from raceguard.reporting import result_to_dict, result_to_text
 
@@ -216,6 +216,73 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual([segment.rider_id for segment in result.segments], ["142"])
         self.assertIsNone(result.segments[0].average_power_w)
+
+    def test_multi_rider_output_labels_ahead_and_behind_metrics(self) -> None:
+        result = analyze(load_csv("examples/sample_race.csv"))
+        segment = next(segment for segment in result.segments if segment.rider_id == "142")
+
+        self.assertEqual(segment.rider_ahead_id, "138")
+        self.assertEqual(segment.rider_behind_id, "142")
+        self.assertIsNotNone(segment.rider_ahead_speed_mps)
+        self.assertIsNotNone(segment.rider_behind_speed_mps)
+        self.assertIsNotNone(segment.rider_ahead_power_w)
+        self.assertIsNotNone(segment.rider_behind_power_w)
+        self.assertAlmostEqual(segment.direction_heading_deg or -1, 0.0, delta=1.0)
+        self.assertIn("Rider ahead: 138", result_to_text(result))
+        self.assertIn("Rider behind: 142", result_to_text(result))
+        self.assertIn("Direction of travel: N", result_to_text(result))
+
+    def test_heading_uses_coherent_travel_direction(self) -> None:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        points = [
+            TelemetryPoint(
+                rider_id="northbound",
+                timestamp=started + timedelta(seconds=index),
+                latitude=40 + index * 0.0001,
+                longitude=-74.0,
+                speed_mps=12.0,
+            )
+            for index in range(6)
+        ]
+
+        heading = _stable_heading(points, AnalysisConfig())
+
+        self.assertIsNotNone(heading)
+        self.assertAlmostEqual(heading or -1, 0.0, delta=1.0)
+
+    def test_heading_rejects_a_turnaround_as_ambiguous(self) -> None:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        latitudes = [40.0, 40.0001, 40.0002, 40.0001, 40.0]
+        points = [
+            TelemetryPoint(
+                rider_id="turnaround",
+                timestamp=started + timedelta(seconds=index),
+                latitude=latitude,
+                longitude=-74.0,
+                speed_mps=12.0,
+            )
+            for index, latitude in enumerate(latitudes)
+        ]
+
+        self.assertIsNone(_stable_heading(points, AnalysisConfig()))
+
+    def test_close_pass_under_ten_seconds_is_not_proximity_evidence(self) -> None:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        points = [
+            TelemetryPoint(
+                rider_id=rider_id,
+                timestamp=started + timedelta(seconds=index),
+                latitude=40 + index * 0.0001 + latitude_offset,
+                longitude=-74.0,
+                speed_mps=12.0,
+            )
+            for index in range(10)
+            for rider_id, latitude_offset in (("ahead", 0.00006), ("behind", 0.0))
+        ]
+
+        result = analyze(points)
+
+        self.assertFalse(result.is_suspicious)
 
     def test_repeated_low_power_sections_are_compared_with_similar_sections(self) -> None:
         profile = RiderProfile("repeat", cda_m2=0.25)

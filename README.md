@@ -426,7 +426,9 @@ The current detector has two evidence paths:
    persist for at least 15 seconds. No generic rider CdA can create a single-rider flag.
 2. **Trailing-rider GPS.** When multiple riders are uploaded, synchronized samples are checked
    for a rider moving behind another in the same direction and within a narrow lateral band.
-   Sustained trailing can produce a review flag even without power. A nearby rider alongside
+   The same ahead/behind pairing must remain close for more than ten seconds before it counts.
+   Sustained trailing can produce a review flag even without power. Reports label both riders
+   and show each rider's speed and power alongside their mean separation. A nearby rider alongside
    or behind the target is not treated as a drafting leader.
 
 FIT files commonly provide timestamps, GPS, speed, distance, elevation, power, and cadence,
