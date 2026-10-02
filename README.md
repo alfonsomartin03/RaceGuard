@@ -421,6 +421,25 @@ A single FIT activity can be flagged from a sustained mismatch between measured 
 the estimated solo power required for its speed. Multi-rider uploads add independent GPS
 proximity evidence and therefore support a higher-confidence assessment.
 
+For activities with at least 20 usable power samples, RaceGuard infers a robust rider-specific
+aerodynamic baseline from the file instead of assuming the default CdA. It adjusts each sample
+for gradient and rolling resistance, then uses median absolute deviation to identify sustained
+power-to-speed outliers. This keeps a consistently aerodynamic rider from being flagged simply
+for having a better position while still surfacing same-power/higher-speed anomalies. Short
+activities fall back to the configured physics profile and are reported with lower confidence.
+
+Telemetry is evaluated with a centered seven-second rolling window. Windows around stopped
+pedaling, soft pedaling, or the transition back onto power are excluded from power-anomaly
+evidence using power and cadence when available. A genuine power-to-speed anomaly must remain
+after smoothing and still satisfy the minimum segment duration; GPS proximity remains an
+independent source of evidence in multi-rider files.
+
+When an activity has elevation but no explicit grade—as is typical for FIT records—RaceGuard
+derives gradient from the elevation change over at least 20 meters of traveled distance. The
+power model also includes acceleration or deceleration measured across the rolling window.
+Candidates must exceed both a 45 W absolute deficit and a 15% proportional deficit, which
+prevents small sensor or model errors from being amplified merely because the rider is fast.
+
 ### Analyze from the command line
 
 The included sample contains two nearby riders and can be run without third-party packages:
@@ -442,8 +461,10 @@ uvicorn raceguard.api:app --reload
 ```
 
 Open `http://127.0.0.1:8000`, upload telemetry, and inspect the activity assessment,
-confidence score, review locations, and contributing evidence. CSV files can contain one or
-more riders. FIT files are analyzed as a single rider and the console prompts for a rider ID.
+confidence score, review locations, and contributing evidence. Up to 20 CSV/FIT activities
+can be selected in one submission and are analyzed together. CSV files can contain one or
+more riders; each FIT file receives an editable rider label defaulted from its filename.
+Review locations are returned chronologically so an official can follow the activity timeline.
 Uploaded files are processed locally in a temporary file and are deleted after analysis.
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
 
