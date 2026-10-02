@@ -406,7 +406,7 @@ results separate from adjudication: every result is phrased as a review recommen
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev,api,fit]'
+python -m pip install -e '.[dev]'
 pytest
 ```
 
@@ -461,7 +461,7 @@ CSV columns are `rider_id`, ISO-8601 `timestamp`, `latitude`, `longitude`, and e
 ### Run the review console
 
 ```bash
-python -m pip install -e '.[api]'
+python -m pip install -e .
 uvicorn raceguard.api:app --reload
 ```
 
@@ -470,13 +470,20 @@ evidence score, review locations, and contributing evidence. Up to 20 CSV/FIT ac
 can be selected in one submission and are analyzed together. CSV files can contain one or
 more riders; each FIT file receives an editable rider label defaulted from its filename.
 Review locations are returned chronologically so an official can follow the activity timeline.
+
+### Deploy to Vercel
+
+The FastAPI entrypoint and runtime dependencies are declared in `pyproject.toml`. Connect the
+GitHub repository to Vercel with the repository root as the Root Directory, leave the Framework
+Preset on automatic detection, and do not set a custom Build Command or Output Directory. Vercel
+will serve the FastAPI application, including the dashboard at `/` and analysis endpoint at
+`/api/analyze`.
 Uploaded files are processed locally in a temporary file and are deleted after analysis.
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
 
-FIT input requires the optional dependency and a rider identifier:
+FIT input accepts a rider identifier when using the command line:
 
 ```bash
-python -m pip install -e '.[fit]'
 raceguard activity.fit --rider-id 142
 ```
 
