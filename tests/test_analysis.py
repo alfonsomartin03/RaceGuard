@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from raceguard.analysis import analyze
 from raceguard.ingest import load_csv
@@ -71,9 +71,55 @@ class AnalysisTests(unittest.TestCase):
         self.assertGreaterEqual(result.confidence, 0.55)
         self.assertGreater(result.segments[0].expected_power_w, result.segments[0].average_power_w)
 
+    def test_coasting_at_high_speed_is_not_flagged(self) -> None:
+        profile = RiderProfile("coasting", cda_m2=0.18)
+        points = self._activity_points(profile, outlier_samples=0)
+        started = points[0].timestamp
+        points.extend(
+            TelemetryPoint(
+                rider_id=profile.rider_id,
+                timestamp=started + timedelta(seconds=60 + index),
+                latitude=40.006 + index * 0.0001,
+                longitude=-74.0,
+                speed_mps=15.0,
+                power_w=0.0,
+                cadence_rpm=0.0,
+                gradient=-0.02,
+            )
+            for index in range(25)
+        )
+
+        result = analyze(points)
+
+        self.assertFalse(result.is_suspicious)
+
+    def test_short_soft_pedaling_and_restart_do_not_create_flag(self) -> None:
+        profile = RiderProfile("transition", cda_m2=0.18)
+        points = self._activity_points(profile, outlier_samples=0)
+        started = points[0].timestamp
+        baseline_power = points[0].power_w
+        for index in range(16):
+            restarting = index >= 8
+            points.append(
+                TelemetryPoint(
+                    rider_id=profile.rider_id,
+                    timestamp=started + timedelta(seconds=60 + index),
+                    latitude=40.006 + index * 0.0001,
+                    longitude=-74.0,
+                    speed_mps=15.0,
+                    power_w=baseline_power if restarting else 40.0,
+                    cadence_rpm=85.0 if restarting else 20.0,
+                    gradient=0.01,
+                )
+            )
+
+        result = analyze(points)
+
+        self.assertFalse(result.is_suspicious)
+
     @staticmethod
     def _activity_points(profile: RiderProfile, outlier_samples: int) -> list[TelemetryPoint]:
-        started = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        started = datetime(2026, 6, 1, tzinfo=UTC)
         baseline_samples = 60
         baseline_speed = 12.0
         baseline_power = expected_solo_power(baseline_speed, 0.01, profile)

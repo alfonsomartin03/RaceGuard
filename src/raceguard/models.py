@@ -53,6 +53,11 @@ class AnalysisConfig:
     score_threshold: float = 0.55
     minimum_baseline_points: int = 20
     outlier_z_threshold: float = 2.5
+    rolling_window_seconds: float = 7.0
+    pedaling_transition_seconds: float = 4.0
+    minimum_pedaling_power_w: float = 75.0
+    soft_pedaling_fraction: float = 0.35
+    minimum_pedaling_cadence_rpm: float = 30.0
 
 
 @dataclass(frozen=True, slots=True)

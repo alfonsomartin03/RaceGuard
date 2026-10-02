@@ -428,6 +428,12 @@ power-to-speed outliers. This keeps a consistently aerodynamic rider from being 
 for having a better position while still surfacing same-power/higher-speed anomalies. Short
 activities fall back to the configured physics profile and are reported with lower confidence.
 
+Telemetry is evaluated with a centered seven-second rolling window. Windows around stopped
+pedaling, soft pedaling, or the transition back onto power are excluded from power-anomaly
+evidence using power and cadence when available. A genuine power-to-speed anomaly must remain
+after smoothing and still satisfy the minimum segment duration; GPS proximity remains an
+independent source of evidence in multi-rider files.
+
 ### Analyze from the command line
 
 The included sample contains two nearby riders and can be run without third-party packages:

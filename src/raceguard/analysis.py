@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import pairwise
 from statistics import fmean, median
 
 from .ingest import haversine_m
@@ -54,6 +55,14 @@ class _PowerBaseline:
     adaptive: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _RollingSignal:
+    speed_mps: float
+    gradient: float
+    power_w: float | None
+    stable_pedaling: bool
+
+
 def analyze(
     points: list[TelemetryPoint],
     profiles: dict[str, RiderProfile] | None = None,
@@ -73,7 +82,8 @@ def analyze(
             "without rider-proximity evidence."
         )
 
-    baselines = _build_power_baselines(points, profiles, config)
+    rolling_signals = _build_rolling_signals(points, config)
+    baselines = _build_power_baselines(points, profiles, config, rolling_signals)
     calibrated = [rider_id for rider_id, baseline in baselines.items() if baseline.adaptive]
     if calibrated:
         warnings.append(
@@ -90,6 +100,7 @@ def analyze(
     for timestamp in sorted(by_time):
         samples = by_time[timestamp]
         for point in samples:
+            signal = rolling_signals[(point.rider_id, point.timestamp)]
             nearest_id: str | None = None
             nearest_distance: float | None = None
             for other in samples:
@@ -102,13 +113,13 @@ def analyze(
             baseline = baselines[point.rider_id]
             profile = baseline.profile
             expected = expected_solo_power(
-                point.speed_mps,
-                point.gradient,
+                signal.speed_mps,
+                signal.gradient,
                 profile,
                 air_density_kg_m3=config.air_density_kg_m3,
                 headwind_mps=config.wind_speed_mps,
-            ) if point.power_w is not None else None
-            deficit = max(0.0, (expected or 0.0) - (point.power_w or 0.0))
+            ) if signal.stable_pedaling and signal.power_w is not None else None
+            deficit = max(0.0, (expected or 0.0) - (signal.power_w or 0.0))
             outlier_z = (
                 (deficit - baseline.residual_center_w) / baseline.residual_scale_w
                 if baseline.adaptive and baseline.residual_scale_w > 0
@@ -122,7 +133,7 @@ def analyze(
             close = nearest_distance is not None and nearest_distance <= config.proximity_threshold_m
             anomalous = (
                 expected is not None
-                and point.speed_mps >= config.minimum_speed_mps
+                and signal.speed_mps >= config.minimum_speed_mps
                 and deficit >= config.minimum_power_deficit_w
                 and (
                     not baseline.adaptive
@@ -178,7 +189,7 @@ def _contiguous_runs(items: list[_Candidate], max_gap: float) -> list[list[_Cand
 def _typical_interval_seconds(run: list[_Candidate]) -> float:
     gaps = [
         (current.point.timestamp - previous.point.timestamp).total_seconds()
-        for previous, current in zip(run, run[1:])
+        for previous, current in pairwise(run)
         if current.point.timestamp > previous.point.timestamp
     ]
     return min(fmean(gaps), 5.0) if gaps else 1.0
@@ -264,6 +275,7 @@ def _build_power_baselines(
     points: list[TelemetryPoint],
     supplied_profiles: dict[str, RiderProfile],
     config: AnalysisConfig,
+    rolling_signals: dict[tuple[str, datetime], _RollingSignal],
 ) -> dict[str, _PowerBaseline]:
     """Infer a rider-specific aero baseline, then measure robust residual variation.
 
@@ -278,9 +290,19 @@ def _build_power_baselines(
     baselines: dict[str, _PowerBaseline] = {}
     for rider_id, rider_points in by_rider.items():
         base_profile = supplied_profiles.get(rider_id, RiderProfile(rider_id))
+        modeled_points = [
+            replace(
+                point,
+                speed_mps=signal.speed_mps,
+                power_w=signal.power_w,
+                gradient=signal.gradient,
+            )
+            for point in rider_points
+            if (signal := rolling_signals[(point.rider_id, point.timestamp)]).stable_pedaling
+        ]
         inferred_cdas = [
             cda
-            for point in rider_points
+            for point in modeled_points
             if (cda := _infer_cda(point, base_profile, config)) is not None
         ]
         if len(inferred_cdas) < config.minimum_baseline_points:
@@ -297,7 +319,7 @@ def _build_power_baselines(
                 headwind_mps=config.wind_speed_mps,
             )
             - point.power_w
-            for point in rider_points
+            for point in modeled_points
             if point.power_w is not None and point.speed_mps >= config.minimum_speed_mps
         ]
         center = median(residuals)
@@ -309,6 +331,74 @@ def _build_power_baselines(
             adaptive=True,
         )
     return baselines
+
+
+def _build_rolling_signals(
+    points: list[TelemetryPoint], config: AnalysisConfig
+) -> dict[tuple[str, datetime], _RollingSignal]:
+    """Smooth telemetry and exclude coasting or pedaling-transition windows."""
+
+    by_rider: dict[str, list[TelemetryPoint]] = defaultdict(list)
+    for point in points:
+        by_rider[point.rider_id].append(point)
+
+    signals: dict[tuple[str, datetime], _RollingSignal] = {}
+    for rider_points in by_rider.values():
+        ordered = sorted(rider_points, key=lambda item: item.timestamp)
+        positive_powers = [
+            point.power_w for point in ordered if point.power_w is not None and point.power_w > 0
+        ]
+        typical_power = median(positive_powers) if positive_powers else 0.0
+        active_threshold = max(
+            config.minimum_pedaling_power_w,
+            typical_power * config.soft_pedaling_fraction,
+        )
+        active = [
+            point.power_w is not None
+            and point.power_w >= active_threshold
+            and (
+                point.cadence_rpm is None
+                or point.cadence_rpm >= config.minimum_pedaling_cadence_rpm
+            )
+            for point in ordered
+        ]
+        inactive_prefix = [0]
+        for is_active in active:
+            inactive_prefix.append(inactive_prefix[-1] + (not is_active))
+
+        smooth_left = smooth_right = transition_left = transition_right = 0
+        half_window = config.rolling_window_seconds / 2
+        for index, point in enumerate(ordered):
+            while (point.timestamp - ordered[smooth_left].timestamp).total_seconds() > half_window:
+                smooth_left += 1
+            while (
+                smooth_right < len(ordered)
+                and (ordered[smooth_right].timestamp - point.timestamp).total_seconds() <= half_window
+            ):
+                smooth_right += 1
+            while (
+                point.timestamp - ordered[transition_left].timestamp
+            ).total_seconds() > config.pedaling_transition_seconds:
+                transition_left += 1
+            while (
+                transition_right < len(ordered)
+                and (ordered[transition_right].timestamp - point.timestamp).total_seconds()
+                <= config.pedaling_transition_seconds
+            ):
+                transition_right += 1
+
+            window = ordered[smooth_left:smooth_right]
+            powers = [item.power_w for item in window if item.power_w is not None]
+            stable = (
+                inactive_prefix[transition_right] - inactive_prefix[transition_left] == 0
+            )
+            signals[(point.rider_id, point.timestamp)] = _RollingSignal(
+                speed_mps=fmean(item.speed_mps for item in window),
+                gradient=fmean(item.gradient for item in window),
+                power_w=fmean(powers) if powers else None,
+                stable_pedaling=stable,
+            )
+    return signals
 
 
 def _infer_cda(
