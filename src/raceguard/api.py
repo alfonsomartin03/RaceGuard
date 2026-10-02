@@ -23,6 +23,8 @@ app = FastAPI(
     description="Review-oriented telemetry screening; results are not adjudications.",
 )
 
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024
+
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -44,6 +46,7 @@ async def analyze_upload(
         raise HTTPException(400, "Upload no more than 20 activity files at once")
     supplied_ids = rider_ids or ([rider_id] if rider_id else [])
     fit_index = 0
+    uploaded_bytes = 0
     all_points = []
     for upload in uploads:
         filename = upload.filename or "telemetry.csv"
@@ -53,8 +56,9 @@ async def analyze_upload(
         content = await upload.read()
         if not content:
             raise HTTPException(400, f"{filename}: the uploaded file is empty")
-        if len(content) > 25 * 1024 * 1024:
-            raise HTTPException(413, f"{filename}: file exceeds the 25 MB limit")
+        uploaded_bytes += len(content)
+        if uploaded_bytes > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Combined upload exceeds the 4 MB deployment limit")
 
         temporary_path: Path | None = None
         try:

@@ -182,7 +182,7 @@
           <input id="file" name="file" type="file" accept=".csv,.fit" multiple required>
           <span class="upload-icon" aria-hidden="true">↑</span>
           <strong>Drop files here or choose activities</strong>
-          <small>.FIT or .CSV · up to 20 files · 25 MB each</small>
+          <small>.FIT or .CSV · up to 20 files · 4 MB combined</small>
           <span class="selected-file" id="selected-file" hidden></span>
         </label>
 
@@ -283,6 +283,10 @@
       try {
         if (window.location.protocol === 'file:') {
           throw new Error('Open http://127.0.0.1:8000/ in your browser, then upload the activity there. The saved HTML file cannot contact the analyzer.');
+        }
+        const uploadBytes = [...fileInput.files].reduce((total, file) => total + file.size, 0);
+        if (uploadBytes > 4 * 1024 * 1024) {
+          throw new Error('The selected activities exceed the 4 MB combined upload limit. Choose fewer or smaller files.');
         }
         const body = new FormData(form);
         const response = await fetch('/api/analyze', { method: 'POST', body });

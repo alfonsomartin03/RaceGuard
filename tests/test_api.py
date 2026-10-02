@@ -47,6 +47,15 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["summary"]["points_analyzed"], 24)
         self.assertEqual(response.json()["summary"]["riders_analyzed"], ["138", "142", "238", "242"])
 
+    def test_combined_upload_limit_is_enforced(self) -> None:
+        response = self.client.post(
+            "/api/analyze",
+            files={"file": ("oversized.csv", b"x" * (4 * 1024 * 1024 + 1), "text/csv")},
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertIn("4 MB", response.json()["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()
