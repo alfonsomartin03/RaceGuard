@@ -53,8 +53,8 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("power-to-speed anomalies", result.warnings[0])
 
     def test_aero_rider_is_calibrated_from_activity_baseline(self) -> None:
-        profile = RiderProfile("aero", cda_m2=0.18)
-        points = self._activity_points(profile, outlier_samples=0)
+        profile = RiderProfile("aero", cda_m2=0.15)
+        points = self._activity_points(profile, outlier_samples=0, baseline_speed=16.0)
 
         result = analyze(points)
 
@@ -117,11 +117,41 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertFalse(result.is_suspicious)
 
+    def test_derived_downhill_gradient_prevents_fast_descent_flag(self) -> None:
+        profile = RiderProfile("descender", cda_m2=0.18)
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        flat_power = expected_solo_power(15.0, 0.0, profile)
+        downhill_power = expected_solo_power(15.0, -0.01, profile)
+        points: list[TelemetryPoint] = []
+        for index in range(85):
+            descending = index >= 60
+            descent_distance = max(0.0, (index - 59) * 15.0)
+            points.append(
+                TelemetryPoint(
+                    rider_id=profile.rider_id,
+                    timestamp=started + timedelta(seconds=index),
+                    latitude=40.0 + index * 0.0001,
+                    longitude=-74.0,
+                    speed_mps=15.0,
+                    power_w=downhill_power if descending else flat_power,
+                    elevation_m=100.0 - 0.01 * descent_distance,
+                    distance_m=index * 15.0,
+                    cadence_rpm=90.0,
+                    # FIT records do not include grade; analysis must derive it.
+                    gradient=0.0,
+                )
+            )
+
+        result = analyze(points)
+
+        self.assertFalse(result.is_suspicious)
+
     @staticmethod
-    def _activity_points(profile: RiderProfile, outlier_samples: int) -> list[TelemetryPoint]:
+    def _activity_points(
+        profile: RiderProfile, outlier_samples: int, baseline_speed: float = 12.0
+    ) -> list[TelemetryPoint]:
         started = datetime(2026, 6, 1, tzinfo=UTC)
         baseline_samples = 60
-        baseline_speed = 12.0
         baseline_power = expected_solo_power(baseline_speed, 0.01, profile)
         points = [
             TelemetryPoint(

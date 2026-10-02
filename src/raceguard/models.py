@@ -48,6 +48,7 @@ class AnalysisConfig:
     proximity_threshold_m: float = 15.0
     minimum_segment_seconds: float = 15.0
     minimum_power_deficit_w: float = 45.0
+    minimum_power_deficit_ratio: float = 0.15
     minimum_speed_mps: float = 8.0
     maximum_sample_gap_seconds: float = 5.0
     score_threshold: float = 0.55
@@ -58,6 +59,7 @@ class AnalysisConfig:
     minimum_pedaling_power_w: float = 75.0
     soft_pedaling_fraction: float = 0.35
     minimum_pedaling_cadence_rpm: float = 30.0
+    minimum_gradient_distance_m: float = 20.0
 
 
 @dataclass(frozen=True, slots=True)

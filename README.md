@@ -434,6 +434,12 @@ evidence using power and cadence when available. A genuine power-to-speed anomal
 after smoothing and still satisfy the minimum segment duration; GPS proximity remains an
 independent source of evidence in multi-rider files.
 
+When an activity has elevation but no explicit grade—as is typical for FIT records—RaceGuard
+derives gradient from the elevation change over at least 20 meters of traveled distance. The
+power model also includes acceleration or deceleration measured across the rolling window.
+Candidates must exceed both a 45 W absolute deficit and a 15% proportional deficit, which
+prevents small sensor or model errors from being amplified merely because the rider is fast.
+
 ### Analyze from the command line
 
 The included sample contains two nearby riders and can be run without third-party packages:

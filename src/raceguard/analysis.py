@@ -59,6 +59,7 @@ class _PowerBaseline:
 class _RollingSignal:
     speed_mps: float
     gradient: float
+    acceleration_mps2: float
     power_w: float | None
     stable_pedaling: bool
 
@@ -118,6 +119,7 @@ def analyze(
                 profile,
                 air_density_kg_m3=config.air_density_kg_m3,
                 headwind_mps=config.wind_speed_mps,
+                acceleration_mps2=signal.acceleration_mps2,
             ) if signal.stable_pedaling and signal.power_w is not None else None
             deficit = max(0.0, (expected or 0.0) - (signal.power_w or 0.0))
             outlier_z = (
@@ -135,6 +137,7 @@ def analyze(
                 expected is not None
                 and signal.speed_mps >= config.minimum_speed_mps
                 and deficit >= config.minimum_power_deficit_w
+                and deficit / max(expected, 1.0) >= config.minimum_power_deficit_ratio
                 and (
                     not baseline.adaptive
                     or outlier_z >= config.outlier_z_threshold
@@ -290,20 +293,25 @@ def _build_power_baselines(
     baselines: dict[str, _PowerBaseline] = {}
     for rider_id, rider_points in by_rider.items():
         base_profile = supplied_profiles.get(rider_id, RiderProfile(rider_id))
-        modeled_points = [
-            replace(
-                point,
-                speed_mps=signal.speed_mps,
-                power_w=signal.power_w,
-                gradient=signal.gradient,
-            )
-            for point in rider_points
-            if (signal := rolling_signals[(point.rider_id, point.timestamp)]).stable_pedaling
-        ]
+        modeled_points = []
+        for point in rider_points:
+            signal = rolling_signals[(point.rider_id, point.timestamp)]
+            if signal.stable_pedaling:
+                modeled_points.append(
+                    (
+                        replace(
+                            point,
+                            speed_mps=signal.speed_mps,
+                            power_w=signal.power_w,
+                            gradient=signal.gradient,
+                        ),
+                        signal.acceleration_mps2,
+                    )
+                )
         inferred_cdas = [
             cda
-            for point in modeled_points
-            if (cda := _infer_cda(point, base_profile, config)) is not None
+            for point, acceleration in modeled_points
+            if (cda := _infer_cda(point, base_profile, config, acceleration)) is not None
         ]
         if len(inferred_cdas) < config.minimum_baseline_points:
             baselines[rider_id] = _PowerBaseline(base_profile)
@@ -317,9 +325,10 @@ def _build_power_baselines(
                 adaptive_profile,
                 air_density_kg_m3=config.air_density_kg_m3,
                 headwind_mps=config.wind_speed_mps,
+                acceleration_mps2=acceleration,
             )
             - point.power_w
-            for point in modeled_points
+            for point, acceleration in modeled_points
             if point.power_w is not None and point.speed_mps >= config.minimum_speed_mps
         ]
         center = median(residuals)
@@ -389,22 +398,54 @@ def _build_rolling_signals(
 
             window = ordered[smooth_left:smooth_right]
             powers = [item.power_w for item in window if item.power_w is not None]
+            elapsed = (window[-1].timestamp - window[0].timestamp).total_seconds()
+            acceleration = (
+                (window[-1].speed_mps - window[0].speed_mps) / elapsed
+                if elapsed > 0
+                else 0.0
+            )
+            supplied_gradient = fmean(item.gradient for item in window)
+            derived_gradient = _gradient_from_window(window, config)
             stable = (
                 inactive_prefix[transition_right] - inactive_prefix[transition_left] == 0
             )
             signals[(point.rider_id, point.timestamp)] = _RollingSignal(
                 speed_mps=fmean(item.speed_mps for item in window),
-                gradient=fmean(item.gradient for item in window),
+                gradient=(
+                    supplied_gradient
+                    if abs(supplied_gradient) > 0.0001 or derived_gradient is None
+                    else derived_gradient
+                ),
+                acceleration_mps2=acceleration,
                 power_w=fmean(powers) if powers else None,
                 stable_pedaling=stable,
             )
     return signals
 
 
+def _gradient_from_window(
+    window: list[TelemetryPoint], config: AnalysisConfig
+) -> float | None:
+    """Derive road grade from smoothed elevation and traveled distance."""
+
+    first, last = window[0], window[-1]
+    if first.elevation_m is None or last.elevation_m is None:
+        return None
+    if first.distance_m is not None and last.distance_m is not None:
+        traveled = last.distance_m - first.distance_m
+    else:
+        traveled = haversine_m(first, last)
+    if traveled < config.minimum_gradient_distance_m:
+        return None
+    gradient = (last.elevation_m - first.elevation_m) / traveled
+    return max(-0.25, min(0.25, gradient))
+
+
 def _infer_cda(
     point: TelemetryPoint,
     profile: RiderProfile,
     config: AnalysisConfig,
+    acceleration_mps2: float = 0.0,
 ) -> float | None:
     if point.power_w is None or point.speed_mps < config.minimum_speed_mps:
         return None
@@ -414,7 +455,8 @@ def _infer_cda(
     wheel_power = point.power_w * profile.drivetrain_efficiency
     rolling_w = profile.crr * profile.total_mass_kg * GRAVITY_MPS2 * point.speed_mps
     climbing_w = profile.total_mass_kg * GRAVITY_MPS2 * point.gradient * point.speed_mps
-    aerodynamic_w = wheel_power - rolling_w - climbing_w
+    acceleration_w = profile.total_mass_kg * acceleration_mps2 * point.speed_mps
+    aerodynamic_w = wheel_power - rolling_w - climbing_w - acceleration_w
     if aerodynamic_w <= 0:
         return None
     inferred = 2 * aerodynamic_w / (config.air_density_kg_m3 * air_speed**3)
