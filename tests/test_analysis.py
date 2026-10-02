@@ -314,6 +314,52 @@ class AnalysisTests(unittest.TestCase):
             sorted(segment.start_time for segment in contextual),
         )
 
+    def test_single_rider_event_between_fixed_boundaries_is_detected(self) -> None:
+        profile = RiderProfile("offset", cda_m2=0.25)
+        normal_power = expected_solo_power(12.0, 0.01, profile)
+        points = self._phased_activity(
+            profile.rider_id,
+            [
+                (127, 12.0, 0.01, normal_power),
+                (18, 12.0, 0.01, normal_power - 100),
+                (127, 12.0, 0.01, normal_power),
+            ],
+        )
+
+        result = analyze(points)
+
+        self.assertTrue(result.is_suspicious)
+        event_start = points[127].timestamp
+        event_end = points[144].timestamp
+        self.assertTrue(
+            any(
+                segment.start_time <= event_end and segment.end_time >= event_start
+                for segment in result.segments
+            )
+        )
+
+    def test_multiple_single_rider_events_are_reported_separately(self) -> None:
+        profile = RiderProfile("multiple", cda_m2=0.25)
+        normal_power = expected_solo_power(12.0, 0.01, profile)
+        points = self._phased_activity(
+            profile.rider_id,
+            [
+                (100, 12.0, 0.01, normal_power),
+                (22, 12.0, 0.01, normal_power - 100),
+                (70, 12.0, 0.01, normal_power),
+                (22, 12.0, 0.01, normal_power - 100),
+                (100, 12.0, 0.01, normal_power),
+            ],
+        )
+
+        result = analyze(points)
+
+        self.assertGreaterEqual(len(result.segments), 2)
+        self.assertGreater(
+            (result.segments[1].start_time - result.segments[0].end_time).total_seconds(),
+            30,
+        )
+
     @staticmethod
     def _phased_activity(
         rider_id: str, phases: list[tuple[int, float, float, float]]

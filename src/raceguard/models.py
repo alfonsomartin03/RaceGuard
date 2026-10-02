@@ -62,6 +62,7 @@ class AnalysisConfig:
     minimum_pedaling_cadence_rpm: float = 30.0
     minimum_gradient_distance_m: float = 20.0
     comparison_section_seconds: float = 10.0
+    comparison_section_stride_seconds: float = 5.0
     comparison_exclusion_seconds: float = 30.0
     comparison_max_seconds: float = 1800.0
     similar_speed_tolerance_mps: float = 0.75

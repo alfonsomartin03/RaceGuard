@@ -417,7 +417,8 @@ The current detector has two evidence paths:
 
 1. **Within-rider power comparison.** A centered seven-second window smooths speed, power,
    grade, and acceleration. Coasting, soft pedaling, cadence dropouts, and nearby transitions
-   are excluded. Stable ten-second sections are compared with sections from the same rider
+   are excluded. Stable ten-second sections, sampled every five seconds so events between
+   fixed boundaries are not diluted, are compared with sections from the same rider
    at similar grade, acceleration, and travel direction, at least 30 seconds apart. Matching
    speed is preferred. If speed differs by at most 3.5 m/s, a speed-cubed aerodynamic
    adjustment is used with a higher threshold. The median of at least two reference sections
