@@ -281,16 +281,23 @@
       submit.disabled = true;
       submit.textContent = 'Analyzing…';
       try {
+        if (window.location.protocol === 'file:') {
+          throw new Error('Open http://127.0.0.1:8000/ in your browser, then upload the activity there. The saved HTML file cannot contact the analyzer.');
+        }
         const body = new FormData(form);
         const response = await fetch('/api/analyze', { method: 'POST', body });
-        const data = await response.json();
+        const data = await response.json().catch(() => {
+          throw new Error(`The analysis server returned an unreadable response (HTTP ${response.status}). Refresh the page and try again.`);
+        });
         if (!response.ok) throw new Error(data.detail || 'The activity could not be analyzed.');
         render(data);
         status.textContent = 'Analysis complete';
         results.hidden = false;
         results.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (error) {
-        status.textContent = error instanceof Error ? error.message : 'Analysis failed. Please check the file and try again.';
+        status.textContent = error instanceof TypeError
+          ? 'Could not reach the analysis server. Make sure it is running at http://127.0.0.1:8000/, refresh this page, and try again.'
+          : error instanceof Error ? error.message : 'Analysis failed. Please check the file and try again.';
         status.classList.add('error');
       } finally {
         submit.disabled = false;
