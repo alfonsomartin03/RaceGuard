@@ -125,7 +125,12 @@ def analyze(
         comparisons = _compare_sections(sections, profile, config)
         for section, evidence in comparisons:
             for frame in section.frames:
-                power_by_key[(rider_id, frame.point.timestamp)] = evidence
+                key = (rider_id, frame.point.timestamp)
+                previous = power_by_key.get(key)
+                if previous is None or _power_evidence_strength(
+                    evidence
+                ) > _power_evidence_strength(previous):
+                    power_by_key[key] = evidence
         if not comparisons and any(frame.stable_pedaling for frame in frames):
             warnings.append(
                 f"Rider {rider_id}: no sustained power anomaly had enough comparable sections "
@@ -305,40 +310,77 @@ def _build_sections(frames: list[_Frame], config: AnalysisConfig) -> list[_Secti
     current: list[_Frame] = []
     for frame in frames:
         if not frame.stable_pedaling or frame.heading_deg is None or frame.power_w is None:
-            _finish_section(current, sections)
+            _finish_section_run(current, sections, config)
             continue
         if current and (
-            (frame.point.timestamp - current[0].point.timestamp).total_seconds()
-            >= config.comparison_section_seconds
-            or (frame.point.timestamp - current[-1].point.timestamp).total_seconds()
+            (frame.point.timestamp - current[-1].point.timestamp).total_seconds()
             > config.maximum_sample_gap_seconds
             or _angle_difference(frame.heading_deg, current[-1].heading_deg or 0) > 20
         ):
-            _finish_section(current, sections)
+            _finish_section_run(current, sections, config)
         current.append(frame)
-    _finish_section(current, sections)
+    _finish_section_run(current, sections, config)
     return sections
 
 
-def _finish_section(current: list[_Frame], sections: list[_Section]) -> None:
-    if len(current) >= 3:
-        elapsed = (current[-1].point.timestamp - current[0].point.timestamp).total_seconds()
-        speeds = [frame.speed_mps for frame in current]
-        grades = [frame.gradient for frame in current]
-        if elapsed >= 5 and max(speeds) - min(speeds) <= 1.5 and max(grades) - min(grades) <= 0.02:
-            sections.append(
-                _Section(
-                    frames=tuple(current),
-                    start=current[0].point.timestamp,
-                    end=current[-1].point.timestamp,
-                    speed_mps=fmean(speeds),
-                    gradient=fmean(grades),
-                    acceleration_mps2=fmean(frame.acceleration_mps2 for frame in current),
-                    heading_deg=_circular_mean([frame.heading_deg for frame in current if frame.heading_deg is not None]),
-                    power_w=fmean(frame.power_w for frame in current if frame.power_w is not None),
-                )
-            )
+def _finish_section_run(
+    current: list[_Frame], sections: list[_Section], config: AnalysisConfig
+) -> None:
+    """Create overlapping windows so event timing cannot hide an anomaly.
+
+    FIT samples are commonly one second apart, but drafting does not begin on a
+    detector-defined ten-second boundary. A half-window stride gives every
+    sustained event at least one well-aligned comparison window while retaining
+    the duration requirement applied later to the merged candidate frames.
+    """
+    if len(current) < 3:
+        current.clear()
+        return
+    timestamps = [frame.point.timestamp for frame in current]
+    window = timedelta(seconds=config.comparison_section_seconds)
+    stride = timedelta(seconds=max(1.0, config.comparison_section_stride_seconds))
+    anchor = timestamps[0]
+    last_timestamp = timestamps[-1]
+    while anchor < last_timestamp:
+        left = bisect_left(timestamps, anchor)
+        right = bisect_right(timestamps, anchor + window)
+        _append_section(current[left:right], sections, config)
+        anchor += stride
     current.clear()
+
+
+def _append_section(
+    frames: list[_Frame], sections: list[_Section], config: AnalysisConfig
+) -> None:
+    if len(frames) < 3:
+        return
+    elapsed = (frames[-1].point.timestamp - frames[0].point.timestamp).total_seconds()
+    speeds = [frame.speed_mps for frame in frames]
+    grades = [frame.gradient for frame in frames]
+    if (
+        elapsed < min(5.0, config.comparison_section_seconds / 2)
+        or max(speeds) - min(speeds) > 1.5
+        or max(grades) - min(grades) > 0.02
+    ):
+        return
+    sections.append(
+        _Section(
+            frames=tuple(frames),
+            start=frames[0].point.timestamp,
+            end=frames[-1].point.timestamp,
+            speed_mps=fmean(speeds),
+            gradient=fmean(grades),
+            acceleration_mps2=fmean(frame.acceleration_mps2 for frame in frames),
+            heading_deg=_circular_mean(
+                [frame.heading_deg for frame in frames if frame.heading_deg is not None]
+            ),
+            power_w=fmean(frame.power_w for frame in frames if frame.power_w is not None),
+        )
+    )
+
+
+def _power_evidence_strength(evidence: _PowerEvidence) -> float:
+    return evidence.deficit_w / max(evidence.reference_w, 1.0)
 
 
 def _circular_mean(angles: list[float]) -> float:
