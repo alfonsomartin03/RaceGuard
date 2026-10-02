@@ -198,8 +198,8 @@
         <h2>What happens next</h2>
         <div class="guide-list">
           <div class="guide-item"><span>1</span><div><strong>Activities are combined</strong><p>One or more files are validated and aligned by timestamp.</p></div></div>
-          <div class="guide-item"><span>2</span><div><strong>Physics are compared</strong><p>Sustained power-to-speed anomalies are scored.</p></div></div>
-          <div class="guide-item"><span>3</span><div><strong>Review points appear</strong><p>See confidence, time, location, and supporting evidence.</p></div></div>
+          <div class="guide-item"><span>2</span><div><strong>Sections are compared</strong><p>Similar sections from the same rider are checked for sustained power differences.</p></div></div>
+          <div class="guide-item"><span>3</span><div><strong>Review points appear</strong><p>See the evidence score, time, location, and supporting measurements.</p></div></div>
         </div>
         <p class="privacy">Your file is processed locally by this server and deleted immediately after analysis.</p>
       </aside>
@@ -213,15 +213,15 @@
             <h2 class="result-title" id="result-title"></h2>
             <p class="subtle" id="result-explanation"></p>
           </div>
-          <div class="score-number"><strong id="confidence"></strong><span>review confidence</span></div>
+          <div class="score-number"><strong id="confidence"></strong><span>evidence score</span></div>
         </div>
-        <div class="scale-wrap" aria-label="Linear confidence scale from zero to one hundred percent">
+        <div class="scale-wrap" aria-label="Linear evidence score scale from zero to one hundred percent">
           <div class="scale-labels"><span>0% · low evidence</span><span>100% · high evidence</span></div>
           <div class="score-track"><div class="score-fill" id="score-fill"></div><div class="threshold" aria-hidden="true"></div></div>
           <div class="threshold-label">55% review threshold</div>
         </div>
         <div class="metrics" id="metrics"></div>
-        <p class="disclaimer">This score is a linear 0–100 representation of the available evidence. It is a screening aid, not the probability that a violation occurred.</p>
+        <p class="disclaimer">This is a rule-based review priority score. It has not been calibrated as the probability of drafting.</p>
       </article>
       <div class="warnings" id="warnings"></div>
       <div class="section-title"><h2>Review locations</h2><span>Ordered chronologically</span></div>
@@ -281,16 +281,23 @@
       submit.disabled = true;
       submit.textContent = 'Analyzing…';
       try {
+        if (window.location.protocol === 'file:') {
+          throw new Error('Open http://127.0.0.1:8000/ in your browser, then upload the activity there. The saved HTML file cannot contact the analyzer.');
+        }
         const body = new FormData(form);
         const response = await fetch('/api/analyze', { method: 'POST', body });
-        const data = await response.json();
+        const data = await response.json().catch(() => {
+          throw new Error(`The analysis server returned an unreadable response (HTTP ${response.status}). Refresh the page and try again.`);
+        });
         if (!response.ok) throw new Error(data.detail || 'The activity could not be analyzed.');
         render(data);
         status.textContent = 'Analysis complete';
         results.hidden = false;
         results.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (error) {
-        status.textContent = error instanceof Error ? error.message : 'Analysis failed. Please check the file and try again.';
+        status.textContent = error instanceof TypeError
+          ? 'Could not reach the analysis server. Make sure it is running at http://127.0.0.1:8000/, refresh this page, and try again.'
+          : error instanceof Error ? error.message : 'Analysis failed. Please check the file and try again.';
         status.classList.add('error');
       } finally {
         submit.disabled = false;
@@ -300,7 +307,7 @@
 
     function render(data) {
       const summary = data.summary;
-      const confidence = clampPercent(summary.confidence);
+      const confidence = clampPercent(summary.evidence_score ?? summary.confidence);
       const flagged = Boolean(summary.is_suspicious);
       const title = document.querySelector('#result-title');
       title.textContent = flagged ? 'Review recommended' : 'No review flags';
@@ -332,7 +339,7 @@
       const courseDistance = segment.course_distance_m == null ? '' : ` · ${(segment.course_distance_m / 1000).toFixed(2)} km`;
       const separation = segment.average_separation_m == null ? 'No comparison rider' : `${Number(segment.average_separation_m).toFixed(1)} m`;
       const power = segment.average_power_w == null ? 'Unavailable' : `${Number(segment.average_power_w).toFixed(0)} W measured`;
-      const expected = segment.expected_power_w == null ? '' : ` / ${Number(segment.expected_power_w).toFixed(0)} W expected`;
+      const expected = segment.expected_power_w == null ? '' : ` / ${Number(segment.expected_power_w).toFixed(0)} W reference`;
       return `<article class="segment-card">
         <div class="segment-top"><div><span class="pill">Review point ${index + 1}</span><h3>Rider ${escapeHtml(segment.rider_id)}</h3></div><div class="mini-score"><strong>${confidence}% evidence</strong><div class="mini-track"><div class="mini-fill" style="width:${confidence}%"></div></div></div></div>
         <dl class="details">
@@ -341,7 +348,7 @@
           ${detail('Nearest rider', escapeHtml(segment.nearest_rider_id || 'Not available'), true)}
           ${detail('Mean separation', separation)}
           ${detail('Mean speed', `${(Number(segment.average_speed_mps) * 3.6).toFixed(1)} km/h`)}
-          ${detail('Power comparison', `${power}${expected}`)}
+          ${detail('Power / matched reference', `${power}${expected}`)}
         </dl>
         <p class="evidence"><strong>Why this was flagged:</strong> ${segment.evidence.notes.map(escapeHtml).join(' ')}</p>
       </article>`;

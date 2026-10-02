@@ -19,6 +19,8 @@ def result_to_dict(result: AnalysisResult) -> dict[str, Any]:
             "segments_for_review": len(result.segments),
             "is_suspicious": result.is_suspicious,
             "confidence": result.confidence,
+            "evidence_score": result.evidence_score,
+            "model": "matched-sections-v2",
             "assessment": "review_recommended" if result.is_suspicious else "no_flags_detected",
         },
         "warnings": list(result.warnings),
@@ -39,7 +41,7 @@ def result_to_text(result: AnalysisResult) -> str:
         "Screening result only — not a finding of a drafting violation.",
         "",
         f"Points: {result.points_analyzed} | Riders: {len(result.riders_analyzed)} | Review segments: {len(result.segments)}",
-        f"Assessment: {'REVIEW RECOMMENDED' if result.is_suspicious else 'NO FLAGS DETECTED'} | Confidence: {result.confidence:.0%}",
+        f"Assessment: {'REVIEW RECOMMENDED' if result.is_suspicious else 'NO FLAGS DETECTED'} | Evidence score: {result.confidence:.0%}",
     ]
     for warning in result.warnings:
         lines.append(f"Warning: {warning}")
@@ -51,7 +53,7 @@ def result_to_text(result: AnalysisResult) -> str:
                 f"   {segment.start_time.isoformat()} to {segment.end_time.isoformat()}",
                 f"   Duration: {segment.duration_seconds:.0f}s | Speed: {(segment.average_speed_mps or 0) * 3.6:.1f} km/h",
                 f"   Nearest rider: {segment.nearest_rider_id or 'unavailable'} | Separation: {_number(segment.average_separation_m, 'm')}",
-                f"   Power: {_number(segment.average_power_w, 'W')} | Expected solo: {_number(segment.expected_power_w, 'W')}",
+                f"   Power: {_number(segment.average_power_w, 'W')} | Matched-section reference: {_number(segment.expected_power_w, 'W')}",
                 f"   Location: {_location(segment.latitude, segment.longitude, segment.course_distance_m)}",
                 "   Recommendation: review footage, observations, weather, and source telemetry.",
             ]

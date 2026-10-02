@@ -1,17 +1,22 @@
-"""Explainable single- and multi-rider screening pipeline."""
+"""Within-activity drafting screening with optional trailing-rider corroboration.
+
+This is a review-priority model. Ground speed and power alone cannot identify
+drafting uniquely because wind and rider position are not measured by FIT records.
+"""
 
 from __future__ import annotations
 
+import math
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from itertools import pairwise
 from statistics import fmean, median
 
-from .ingest import haversine_m
+from .ingest import clean_points, haversine_m
 from .models import AnalysisConfig, Evidence, RiderProfile, SuspiciousSegment, TelemetryPoint
-from .physics import GRAVITY_MPS2, expected_solo_power
+from .physics import GRAVITY_MPS2
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,43 +30,55 @@ class AnalysisResult:
 
     @property
     def is_suspicious(self) -> bool:
-        """Whether at least one segment crossed the configured review threshold."""
-
         return bool(self.segments)
 
     @property
     def confidence(self) -> float:
-        """Highest explainable review score in the activity."""
-
+        """Largest heuristic evidence score; this is not a calibrated probability."""
         return max((segment.score for segment in self.segments), default=0.0)
+
+    @property
+    def evidence_score(self) -> float:
+        return self.confidence
+
+
+@dataclass(frozen=True, slots=True)
+class _Frame:
+    point: TelemetryPoint
+    speed_mps: float
+    gradient: float
+    acceleration_mps2: float
+    heading_deg: float | None
+    power_w: float | None
+    stable_pedaling: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _Section:
+    frames: tuple[_Frame, ...]
+    start: datetime
+    end: datetime
+    speed_mps: float
+    gradient: float
+    acceleration_mps2: float
+    heading_deg: float
+    power_w: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PowerEvidence:
+    reference_w: float
+    deficit_w: float
+    peer_count: int
+    matched_speed: bool
 
 
 @dataclass(frozen=True, slots=True)
 class _Candidate:
-    point: TelemetryPoint
-    nearest_id: str | None
-    separation_m: float | None
-    expected_w: float | None
-    deficit_w: float
-    power_outlier_score: float
-    adaptive_baseline: bool
-
-
-@dataclass(frozen=True, slots=True)
-class _PowerBaseline:
-    profile: RiderProfile
-    residual_center_w: float = 0.0
-    residual_scale_w: float = 0.0
-    adaptive: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _RollingSignal:
-    speed_mps: float
-    gradient: float
-    acceleration_mps2: float
-    power_w: float | None
-    stable_pedaling: bool
+    frame: _Frame
+    power: _PowerEvidence | None = None
+    leader_id: str | None = None
+    separation_m: float | None = None
 
 
 def analyze(
@@ -71,100 +88,62 @@ def analyze(
 ) -> AnalysisResult:
     config = config or AnalysisConfig()
     profiles = profiles or {}
-    riders = tuple(sorted({point.rider_id for point in points}))
-    warnings: list[str] = []
     if not points:
         return AnalysisResult(0, (), None, None, (), ("No valid telemetry points were supplied.",))
-    if all(point.power_w is None for point in points):
-        warnings.append("Power telemetry is absent; review scores rely on proximity and speed.")
-    if len(riders) == 1:
-        warnings.append(
-            "Only one rider is present; screening uses sustained power-to-speed anomalies "
-            "without rider-proximity evidence."
-        )
+    points = clean_points(points)
+    if not points:
+        return AnalysisResult(0, (), None, None, (), ("No valid telemetry points were supplied.",))
 
-    rolling_signals = _build_rolling_signals(points, config)
-    baselines = _build_power_baselines(points, profiles, config, rolling_signals)
-    calibrated = [rider_id for rider_id, baseline in baselines.items() if baseline.adaptive]
-    if calibrated:
-        warnings.append(
-            "Adaptive power-to-speed baselines were inferred from this activity for: "
-            + ", ".join(calibrated)
-            + "."
-        )
-
-    by_time: dict[datetime, list[TelemetryPoint]] = defaultdict(list)
+    by_rider: dict[str, list[TelemetryPoint]] = defaultdict(list)
     for point in points:
-        by_time[point.timestamp].append(point)
+        by_rider[point.rider_id].append(point)
+    riders = tuple(sorted(by_rider))
+    warnings: list[str] = []
+    if len(riders) == 1:
+        warnings.append("Single-rider screening needs repeated comparable conditions; wind and riding position remain unknown.")
+    if all(point.power_w is None for point in points):
+        warnings.append("Power is absent; only sustained trailing-rider GPS evidence can be screened.")
 
-    candidates: dict[tuple[str, str | None], list[_Candidate]] = defaultdict(list)
-    for timestamp in sorted(by_time):
-        samples = by_time[timestamp]
-        for point in samples:
-            signal = rolling_signals[(point.rider_id, point.timestamp)]
-            nearest_id: str | None = None
-            nearest_distance: float | None = None
-            for other in samples:
-                if other.rider_id == point.rider_id:
-                    continue
-                distance = haversine_m(point, other)
-                if nearest_distance is None or distance < nearest_distance:
-                    nearest_id, nearest_distance = other.rider_id, distance
+    frames_by_rider = {
+        rider_id: _build_frames(rider_points, config)
+        for rider_id, rider_points in by_rider.items()
+    }
+    power_by_key: dict[tuple[str, datetime], _PowerEvidence] = {}
+    for rider_id, frames in frames_by_rider.items():
+        profile = profiles.get(rider_id, RiderProfile(rider_id))
+        sections = _build_sections(frames, config)
+        comparisons = _compare_sections(sections, profile, config)
+        for section, evidence in comparisons:
+            for frame in section.frames:
+                power_by_key[(rider_id, frame.point.timestamp)] = evidence
+        if not comparisons and any(frame.stable_pedaling for frame in frames):
+            warnings.append(
+                f"Rider {rider_id}: no sustained power anomaly had enough comparable sections "
+                "at similar speed, grade, and direction."
+            )
 
-            baseline = baselines[point.rider_id]
-            profile = baseline.profile
-            expected = expected_solo_power(
-                signal.speed_mps,
-                signal.gradient,
-                profile,
-                air_density_kg_m3=config.air_density_kg_m3,
-                headwind_mps=config.wind_speed_mps,
-                acceleration_mps2=signal.acceleration_mps2,
-            ) if signal.stable_pedaling and signal.power_w is not None else None
-            deficit = max(0.0, (expected or 0.0) - (signal.power_w or 0.0))
-            outlier_z = (
-                (deficit - baseline.residual_center_w) / baseline.residual_scale_w
-                if baseline.adaptive and baseline.residual_scale_w > 0
-                else 0.0
-            )
-            power_outlier_score = (
-                min(1.0, max(0.0, outlier_z) / 4.0)
-                if baseline.adaptive
-                else min(1.0, deficit / max(config.minimum_power_deficit_w * 2, 1))
-            )
-            close = nearest_distance is not None and nearest_distance <= config.proximity_threshold_m
-            anomalous = (
-                expected is not None
-                and signal.speed_mps >= config.minimum_speed_mps
-                and deficit >= config.minimum_power_deficit_w
-                and deficit / max(expected, 1.0) >= config.minimum_power_deficit_ratio
-                and (
-                    not baseline.adaptive
-                    or outlier_z >= config.outlier_z_threshold
-                )
-            )
-            if close or anomalous:
-                candidates[(point.rider_id, nearest_id if close else None)].append(
+    trailing = _trailing_evidence(frames_by_rider, config)
+    segments: list[SuspiciousSegment] = []
+    for rider_id, frames in frames_by_rider.items():
+        candidates: list[_Candidate] = []
+        for frame in frames:
+            key = (rider_id, frame.point.timestamp)
+            power = power_by_key.get(key)
+            lead = trailing.get(key)
+            if power is not None or lead is not None:
+                candidates.append(
                     _Candidate(
-                        point,
-                        nearest_id if close else None,
-                        nearest_distance if close else None,
-                        expected,
-                        deficit,
-                        power_outlier_score,
-                        baseline.adaptive,
+                        frame=frame,
+                        power=power,
+                        leader_id=lead[0] if lead else None,
+                        separation_m=lead[1] if lead else None,
                     )
                 )
-
-    segments: list[SuspiciousSegment] = []
-    for (rider_id, nearest_id), rider_candidates in candidates.items():
-        for run in _contiguous_runs(rider_candidates, config.maximum_sample_gap_seconds):
-            duration = (run[-1].point.timestamp - run[0].point.timestamp).total_seconds()
-            # One-Hz streams represent the interval following their last sample.
-            sample_duration = duration + _typical_interval_seconds(run)
-            if sample_duration < config.minimum_segment_seconds:
+        for run in _runs(candidates, config.maximum_sample_gap_seconds):
+            duration = _run_duration(run)
+            if duration < config.minimum_segment_seconds:
                 continue
-            segment = _build_segment(rider_id, nearest_id, run, sample_duration, config)
+            segment = _segment_from_run(rider_id, run, duration, config)
             if segment.score >= config.score_threshold:
                 segments.append(segment)
 
@@ -178,256 +157,69 @@ def analyze(
     )
 
 
-def _contiguous_runs(items: list[_Candidate], max_gap: float) -> list[list[_Candidate]]:
-    ordered = sorted(items, key=lambda item: item.point.timestamp)
-    runs: list[list[_Candidate]] = []
-    for item in ordered:
-        if not runs or (item.point.timestamp - runs[-1][-1].point.timestamp).total_seconds() > max_gap:
-            runs.append([item])
-        else:
-            runs[-1].append(item)
-    return runs
-
-
-def _typical_interval_seconds(run: list[_Candidate]) -> float:
-    gaps = [
-        (current.point.timestamp - previous.point.timestamp).total_seconds()
-        for previous, current in pairwise(run)
-        if current.point.timestamp > previous.point.timestamp
+def _build_frames(points: list[TelemetryPoint], config: AnalysisConfig) -> list[_Frame]:
+    ordered = sorted(points, key=lambda point: point.timestamp)
+    timestamps = [point.timestamp for point in ordered]
+    powers = [point.power_w for point in ordered if point.power_w is not None and point.power_w > 0]
+    typical_power = median(powers) if powers else 0.0
+    active_threshold = max(config.minimum_pedaling_power_w, typical_power * config.soft_pedaling_fraction)
+    active = [
+        point.power_w is not None
+        and point.power_w >= active_threshold
+        and (point.cadence_rpm is None or point.cadence_rpm >= config.minimum_pedaling_cadence_rpm)
+        for point in ordered
     ]
-    return min(fmean(gaps), 5.0) if gaps else 1.0
-
-
-def _build_segment(
-    rider_id: str,
-    nearest_id: str | None,
-    run: list[_Candidate],
-    duration: float,
-    config: AnalysisConfig,
-) -> SuspiciousSegment:
-    separations = [item.separation_m for item in run if item.separation_m is not None]
-    powers = [item.point.power_w for item in run if item.point.power_w is not None]
-    expected = [item.expected_w for item in run if item.expected_w is not None]
-    deficits = [item.deficit_w for item in run]
-    average_separation = fmean(separations) if separations else None
-    average_deficit = fmean(deficits) if deficits else 0.0
-
-    proximity_score = (
-        max(0.0, 1.0 - average_separation / config.proximity_threshold_m)
-        if average_separation is not None else 0.0
-    )
-    duration_score = min(1.0, duration / max(config.minimum_segment_seconds * 3, 1))
-    power_score = fmean(item.power_outlier_score for item in run)
-    average_speed = fmean(item.point.speed_mps for item in run)
-    speed_score = min(1.0, average_speed / 15.0)
-    telemetry_confidence = 0.45 + (0.25 if separations else 0) + (0.25 if powers else 0)
-    telemetry_confidence = min(1.0, telemetry_confidence)
-    weighted_evidence = 0.20 * duration_score + 0.15 * speed_score
-    available_weight = 0.35
-    if separations:
-        weighted_evidence += 0.35 * proximity_score
-        available_weight += 0.35
-    if powers:
-        weighted_evidence += 0.30 * power_score
-        available_weight += 0.30
-    # Missing proximity must reduce confidence, not make a single-rider flag impossible.
-    score = (weighted_evidence / available_weight) * telemetry_confidence
-    notes: list[str] = []
-    if separations:
-        notes.append("Sustained rider proximity was detected from synchronized GPS samples.")
-    if average_deficit >= config.minimum_power_deficit_w:
-        if any(item.adaptive_baseline for item in run):
-            notes.append(
-                "Power-to-speed efficiency was a sustained outlier from this rider's "
-                "gradient-adjusted activity baseline."
-            )
-        else:
-            notes.append("Measured power was below the simplified solo-power estimate.")
-    notes.append("Environmental effects and sensor error must be considered by an official.")
-
-    return SuspiciousSegment(
-        rider_id=rider_id,
-        start_time=run[0].point.timestamp,
-        end_time=run[-1].point.timestamp,
-        score=round(score, 3),
-        evidence=Evidence(
-            proximity_score=round(proximity_score, 3),
-            duration_score=round(duration_score, 3),
-            power_score=round(power_score, 3),
-            speed_score=round(speed_score, 3),
-            telemetry_confidence=round(telemetry_confidence, 3),
-            notes=tuple(notes),
-        ),
-        nearest_rider_id=nearest_id,
-        average_separation_m=round(average_separation, 1) if average_separation is not None else None,
-        average_speed_mps=round(average_speed, 2),
-        average_power_w=round(fmean(powers), 1) if powers else None,
-        expected_power_w=round(fmean(expected), 1) if expected else None,
-        latitude=round(fmean(item.point.latitude for item in run), 6),
-        longitude=round(fmean(item.point.longitude for item in run), 6),
-        course_distance_m=_mean_optional(item.point.distance_m for item in run),
-    )
-
-
-def _mean_optional(values: Iterable[float | None]) -> float | None:
-    available = [value for value in values if value is not None]
-    return round(fmean(available), 1) if available else None
-
-
-def _build_power_baselines(
-    points: list[TelemetryPoint],
-    supplied_profiles: dict[str, RiderProfile],
-    config: AnalysisConfig,
-    rolling_signals: dict[tuple[str, datetime], _RollingSignal],
-) -> dict[str, _PowerBaseline]:
-    """Infer a rider-specific aero baseline, then measure robust residual variation.
-
-    Median CdA and median absolute deviation keep short anomalous periods from
-    redefining what is normal for the rest of the activity.
-    """
-
-    by_rider: dict[str, list[TelemetryPoint]] = defaultdict(list)
-    for point in points:
-        by_rider[point.rider_id].append(point)
-
-    baselines: dict[str, _PowerBaseline] = {}
-    for rider_id, rider_points in by_rider.items():
-        base_profile = supplied_profiles.get(rider_id, RiderProfile(rider_id))
-        modeled_points = []
-        for point in rider_points:
-            signal = rolling_signals[(point.rider_id, point.timestamp)]
-            if signal.stable_pedaling:
-                modeled_points.append(
-                    (
-                        replace(
-                            point,
-                            speed_mps=signal.speed_mps,
-                            power_w=signal.power_w,
-                            gradient=signal.gradient,
-                        ),
-                        signal.acceleration_mps2,
-                    )
-                )
-        inferred_cdas = [
-            cda
-            for point, acceleration in modeled_points
-            if (cda := _infer_cda(point, base_profile, config, acceleration)) is not None
-        ]
-        if len(inferred_cdas) < config.minimum_baseline_points:
-            baselines[rider_id] = _PowerBaseline(base_profile)
-            continue
-
-        adaptive_profile = replace(base_profile, cda_m2=median(inferred_cdas))
-        residuals = [
-            expected_solo_power(
-                point.speed_mps,
-                point.gradient,
-                adaptive_profile,
-                air_density_kg_m3=config.air_density_kg_m3,
-                headwind_mps=config.wind_speed_mps,
-                acceleration_mps2=acceleration,
-            )
-            - point.power_w
-            for point, acceleration in modeled_points
-            if point.power_w is not None and point.speed_mps >= config.minimum_speed_mps
-        ]
-        center = median(residuals)
-        mad = median(abs(value - center) for value in residuals)
-        baselines[rider_id] = _PowerBaseline(
-            profile=adaptive_profile,
-            residual_center_w=max(0.0, center),
-            residual_scale_w=max(15.0, 1.4826 * mad),
-            adaptive=True,
+    inactive_prefix = [0]
+    gap_prefix = [0]
+    for index, is_active in enumerate(active):
+        inactive_prefix.append(inactive_prefix[-1] + (not is_active))
+        if index:
+            gap = (timestamps[index] - timestamps[index - 1]).total_seconds()
+            gap_prefix.append(gap_prefix[-1] + (gap > config.maximum_sample_gap_seconds))
+    frames: list[_Frame] = []
+    half_window = config.rolling_window_seconds / 2
+    for point in ordered:
+        left = bisect_left(timestamps, point.timestamp - timedelta(seconds=half_window))
+        right = bisect_right(timestamps, point.timestamp + timedelta(seconds=half_window))
+        window = ordered[left:right]
+        # A recording gap marks a new interval. Do not smooth across missing telemetry.
+        if gap_prefix[right - 1] - gap_prefix[left] > 0:
+            window = [point]
+        elapsed = (window[-1].timestamp - window[0].timestamp).total_seconds()
+        acceleration = (
+            (window[-1].speed_mps - window[0].speed_mps) / elapsed if elapsed > 0 else 0.0
         )
-    return baselines
-
-
-def _build_rolling_signals(
-    points: list[TelemetryPoint], config: AnalysisConfig
-) -> dict[tuple[str, datetime], _RollingSignal]:
-    """Smooth telemetry and exclude coasting or pedaling-transition windows."""
-
-    by_rider: dict[str, list[TelemetryPoint]] = defaultdict(list)
-    for point in points:
-        by_rider[point.rider_id].append(point)
-
-    signals: dict[tuple[str, datetime], _RollingSignal] = {}
-    for rider_points in by_rider.values():
-        ordered = sorted(rider_points, key=lambda item: item.timestamp)
-        positive_powers = [
-            point.power_w for point in ordered if point.power_w is not None and point.power_w > 0
-        ]
-        typical_power = median(positive_powers) if positive_powers else 0.0
-        active_threshold = max(
-            config.minimum_pedaling_power_w,
-            typical_power * config.soft_pedaling_fraction,
+        grade = fmean(sample.gradient for sample in window)
+        derived = _derived_grade(window, config)
+        if abs(grade) < 0.0001 and derived is not None:
+            grade = derived
+        direction_left = bisect_left(timestamps, point.timestamp - timedelta(seconds=8))
+        direction_right = bisect_right(timestamps, point.timestamp + timedelta(seconds=8))
+        direction_points = ordered[direction_left:direction_right]
+        heading = _bearing(direction_points[0], direction_points[-1]) if len(direction_points) > 1 else None
+        transition_left = bisect_left(
+            timestamps, point.timestamp - timedelta(seconds=config.pedaling_transition_seconds)
         )
-        active = [
-            point.power_w is not None
-            and point.power_w >= active_threshold
-            and (
-                point.cadence_rpm is None
-                or point.cadence_rpm >= config.minimum_pedaling_cadence_rpm
-            )
-            for point in ordered
-        ]
-        inactive_prefix = [0]
-        for is_active in active:
-            inactive_prefix.append(inactive_prefix[-1] + (not is_active))
-
-        smooth_left = smooth_right = transition_left = transition_right = 0
-        half_window = config.rolling_window_seconds / 2
-        for index, point in enumerate(ordered):
-            while (point.timestamp - ordered[smooth_left].timestamp).total_seconds() > half_window:
-                smooth_left += 1
-            while (
-                smooth_right < len(ordered)
-                and (ordered[smooth_right].timestamp - point.timestamp).total_seconds() <= half_window
-            ):
-                smooth_right += 1
-            while (
-                point.timestamp - ordered[transition_left].timestamp
-            ).total_seconds() > config.pedaling_transition_seconds:
-                transition_left += 1
-            while (
-                transition_right < len(ordered)
-                and (ordered[transition_right].timestamp - point.timestamp).total_seconds()
-                <= config.pedaling_transition_seconds
-            ):
-                transition_right += 1
-
-            window = ordered[smooth_left:smooth_right]
-            powers = [item.power_w for item in window if item.power_w is not None]
-            elapsed = (window[-1].timestamp - window[0].timestamp).total_seconds()
-            acceleration = (
-                (window[-1].speed_mps - window[0].speed_mps) / elapsed
-                if elapsed > 0
-                else 0.0
-            )
-            supplied_gradient = fmean(item.gradient for item in window)
-            derived_gradient = _gradient_from_window(window, config)
-            stable = (
-                inactive_prefix[transition_right] - inactive_prefix[transition_left] == 0
-            )
-            signals[(point.rider_id, point.timestamp)] = _RollingSignal(
-                speed_mps=fmean(item.speed_mps for item in window),
-                gradient=(
-                    supplied_gradient
-                    if abs(supplied_gradient) > 0.0001 or derived_gradient is None
-                    else derived_gradient
-                ),
+        transition_right = bisect_right(
+            timestamps, point.timestamp + timedelta(seconds=config.pedaling_transition_seconds)
+        )
+        transition = inactive_prefix[transition_right] != inactive_prefix[transition_left]
+        window_powers = [sample.power_w for sample in window if sample.power_w is not None]
+        frames.append(
+            _Frame(
+                point=point,
+                speed_mps=fmean(sample.speed_mps for sample in window),
+                gradient=grade,
                 acceleration_mps2=acceleration,
-                power_w=fmean(powers) if powers else None,
-                stable_pedaling=stable,
+                heading_deg=heading,
+                power_w=fmean(window_powers) if window_powers else None,
+                stable_pedaling=not transition and point.speed_mps >= config.minimum_speed_mps,
             )
-    return signals
+        )
+    return frames
 
 
-def _gradient_from_window(
-    window: list[TelemetryPoint], config: AnalysisConfig
-) -> float | None:
-    """Derive road grade from smoothed elevation and traveled distance."""
-
+def _derived_grade(window: list[TelemetryPoint], config: AnalysisConfig) -> float | None:
     first, last = window[0], window[-1]
     if first.elevation_m is None or last.elevation_m is None:
         return None
@@ -437,27 +229,261 @@ def _gradient_from_window(
         traveled = haversine_m(first, last)
     if traveled < config.minimum_gradient_distance_m:
         return None
-    gradient = (last.elevation_m - first.elevation_m) / traveled
-    return max(-0.25, min(0.25, gradient))
+    return max(-0.25, min(0.25, (last.elevation_m - first.elevation_m) / traveled))
 
 
-def _infer_cda(
-    point: TelemetryPoint,
-    profile: RiderProfile,
-    config: AnalysisConfig,
-    acceleration_mps2: float = 0.0,
+def _bearing(first: TelemetryPoint, last: TelemetryPoint) -> float | None:
+    north = math.radians(last.latitude - first.latitude)
+    east = math.radians(last.longitude - first.longitude) * math.cos(
+        math.radians((first.latitude + last.latitude) / 2)
+    )
+    if math.hypot(north, east) < 1e-9:
+        return None
+    return math.degrees(math.atan2(east, north)) % 360
+
+
+def _angle_difference(first: float, second: float) -> float:
+    return abs((first - second + 180) % 360 - 180)
+
+
+def _build_sections(frames: list[_Frame], config: AnalysisConfig) -> list[_Section]:
+    sections: list[_Section] = []
+    current: list[_Frame] = []
+    for frame in frames:
+        if not frame.stable_pedaling or frame.heading_deg is None or frame.power_w is None:
+            _finish_section(current, sections)
+            continue
+        if current and (
+            (frame.point.timestamp - current[0].point.timestamp).total_seconds()
+            >= config.comparison_section_seconds
+            or (frame.point.timestamp - current[-1].point.timestamp).total_seconds()
+            > config.maximum_sample_gap_seconds
+            or _angle_difference(frame.heading_deg, current[-1].heading_deg or 0) > 20
+        ):
+            _finish_section(current, sections)
+        current.append(frame)
+    _finish_section(current, sections)
+    return sections
+
+
+def _finish_section(current: list[_Frame], sections: list[_Section]) -> None:
+    if len(current) >= 3:
+        elapsed = (current[-1].point.timestamp - current[0].point.timestamp).total_seconds()
+        speeds = [frame.speed_mps for frame in current]
+        grades = [frame.gradient for frame in current]
+        if elapsed >= 5 and max(speeds) - min(speeds) <= 1.5 and max(grades) - min(grades) <= 0.02:
+            sections.append(
+                _Section(
+                    frames=tuple(current),
+                    start=current[0].point.timestamp,
+                    end=current[-1].point.timestamp,
+                    speed_mps=fmean(speeds),
+                    gradient=fmean(grades),
+                    acceleration_mps2=fmean(frame.acceleration_mps2 for frame in current),
+                    heading_deg=_circular_mean([frame.heading_deg for frame in current if frame.heading_deg is not None]),
+                    power_w=fmean(frame.power_w for frame in current if frame.power_w is not None),
+                )
+            )
+    current.clear()
+
+
+def _circular_mean(angles: list[float]) -> float:
+    east = fmean(math.sin(math.radians(angle)) for angle in angles)
+    north = fmean(math.cos(math.radians(angle)) for angle in angles)
+    return math.degrees(math.atan2(east, north)) % 360
+
+
+def _compare_sections(
+    sections: list[_Section], profile: RiderProfile, config: AnalysisConfig
+) -> list[tuple[_Section, _PowerEvidence]]:
+    matches: list[tuple[_Section, _PowerEvidence]] = []
+    for section in sections:
+        peers = [
+            other for other in sections
+            if other is not section
+            and config.comparison_exclusion_seconds
+            <= _section_gap(section, other)
+            <= config.comparison_max_seconds
+            and _angle_difference(section.heading_deg, other.heading_deg) <= 20
+            and abs(section.gradient - other.gradient) <= config.similar_gradient_tolerance
+            and abs(section.acceleration_mps2 - other.acceleration_mps2)
+            <= config.similar_acceleration_tolerance_mps2
+            and abs(section.speed_mps - other.speed_mps) <= 3.5
+        ]
+        if len(peers) < max(2, config.minimum_comparison_sections):
+            continue
+        same_speed = [
+            peer for peer in peers
+            if abs(peer.speed_mps - section.speed_mps) <= config.similar_speed_tolerance_mps
+        ]
+        selected = same_speed if len(same_speed) >= 2 else peers
+        matched_speed = selected is same_speed
+        references = [
+            reference for peer in selected
+            if (reference := _reference_power(peer, section, profile, matched_speed)) is not None
+        ]
+        if len(references) < 2:
+            continue
+        reference_w = median(references)
+        deficit_w = reference_w - section.power_w
+        mad_w = median(abs(value - reference_w) for value in references)
+        min_w = config.minimum_power_deficit_w if matched_speed else max(60.0, config.minimum_power_deficit_w)
+        min_ratio = config.minimum_power_deficit_ratio if matched_speed else max(0.20, config.minimum_power_deficit_ratio)
+        if deficit_w < max(min_w, reference_w * min_ratio, 2.5 * max(20.0, 1.4826 * mad_w)):
+            continue
+        # A drag saving cannot exceed the whole aerodynamic part of solo power.
+        aero_w = max(0.0, reference_w - _mechanical_power(section, profile))
+        if aero_w < 50 or deficit_w > 0.7 * aero_w:
+            continue
+        matches.append(
+            (section, _PowerEvidence(reference_w, deficit_w, len(references), matched_speed))
+        )
+    return matches
+
+
+def _mechanical_power(section: _Section, profile: RiderProfile) -> float:
+    speed = section.speed_mps
+    mass = profile.total_mass_kg
+    wheel_w = (
+        profile.crr * mass * GRAVITY_MPS2 * speed
+        + mass * GRAVITY_MPS2 * section.gradient * speed
+        + mass * section.acceleration_mps2 * speed
+    )
+    return wheel_w / profile.drivetrain_efficiency
+
+
+def _reference_power(
+    peer: _Section, target: _Section, profile: RiderProfile, matched_speed: bool
 ) -> float | None:
-    if point.power_w is None or point.speed_mps < config.minimum_speed_mps:
+    if matched_speed:
+        return peer.power_w + _mechanical_power(target, profile) - _mechanical_power(peer, profile)
+    peer_aero_w = peer.power_w - _mechanical_power(peer, profile)
+    if peer_aero_w <= 0:
         return None
-    air_speed = max(0.0, point.speed_mps + config.wind_speed_mps)
-    if air_speed <= 0:
-        return None
-    wheel_power = point.power_w * profile.drivetrain_efficiency
-    rolling_w = profile.crr * profile.total_mass_kg * GRAVITY_MPS2 * point.speed_mps
-    climbing_w = profile.total_mass_kg * GRAVITY_MPS2 * point.gradient * point.speed_mps
-    acceleration_w = profile.total_mass_kg * acceleration_mps2 * point.speed_mps
-    aerodynamic_w = wheel_power - rolling_w - climbing_w - acceleration_w
-    if aerodynamic_w <= 0:
-        return None
-    inferred = 2 * aerodynamic_w / (config.air_density_kg_m3 * air_speed**3)
-    return inferred if 0.08 <= inferred <= 0.8 else None
+    return _mechanical_power(target, profile) + peer_aero_w * (
+        target.speed_mps / peer.speed_mps
+    ) ** 3
+
+
+def _section_gap(first: _Section, second: _Section) -> float:
+    if first.end < second.start:
+        return (second.start - first.end).total_seconds()
+    if second.end < first.start:
+        return (first.start - second.end).total_seconds()
+    return 0.0
+
+
+def _trailing_evidence(
+    frames_by_rider: dict[str, list[_Frame]], config: AnalysisConfig
+) -> dict[tuple[str, datetime], tuple[str, float]]:
+    if len(frames_by_rider) < 2:
+        return {}
+    timestamps = {
+        rider_id: [frame.point.timestamp for frame in frames]
+        for rider_id, frames in frames_by_rider.items()
+    }
+    trailing: dict[tuple[str, datetime], tuple[str, float]] = {}
+    for rider_id, frames in frames_by_rider.items():
+        for frame in frames:
+            if frame.heading_deg is None or frame.speed_mps < config.minimum_speed_mps:
+                continue
+            best: tuple[str, float] | None = None
+            for other_id, others in frames_by_rider.items():
+                if other_id == rider_id:
+                    continue
+                index = bisect_left(timestamps[other_id], frame.point.timestamp)
+                for candidate_index in (index - 1, index):
+                    if not 0 <= candidate_index < len(others):
+                        continue
+                    other = others[candidate_index]
+                    if abs((other.point.timestamp - frame.point.timestamp).total_seconds()) > 2:
+                        continue
+                    if other.heading_deg is None or _angle_difference(frame.heading_deg, other.heading_deg) > 20:
+                        continue
+                    if abs(frame.speed_mps - other.speed_mps) > 2:
+                        continue
+                    north = math.radians(other.point.latitude - frame.point.latitude) * 6_371_008.8
+                    east = math.radians(other.point.longitude - frame.point.longitude) * 6_371_008.8 * math.cos(math.radians(frame.point.latitude))
+                    angle = math.radians(frame.heading_deg)
+                    ahead = north * math.cos(angle) + east * math.sin(angle)
+                    lateral = abs(east * math.cos(angle) - north * math.sin(angle))
+                    if 2 <= ahead <= config.proximity_threshold_m and lateral <= 5:
+                        separation = math.hypot(ahead, lateral)
+                        if best is None or separation < best[1]:
+                            best = (other_id, separation)
+            if best is not None:
+                trailing[(rider_id, frame.point.timestamp)] = best
+    return trailing
+
+
+def _runs(candidates: list[_Candidate], max_gap: float) -> list[list[_Candidate]]:
+    runs: list[list[_Candidate]] = []
+    for candidate in candidates:
+        if not runs or (candidate.frame.point.timestamp - runs[-1][-1].frame.point.timestamp).total_seconds() > max_gap:
+            runs.append([candidate])
+        else:
+            runs[-1].append(candidate)
+    return runs
+
+
+def _run_duration(run: list[_Candidate]) -> float:
+    observed = (run[-1].frame.point.timestamp - run[0].frame.point.timestamp).total_seconds()
+    intervals = [
+        (right.frame.point.timestamp - left.frame.point.timestamp).total_seconds()
+        for left, right in pairwise(run)
+    ]
+    return observed + min(median(intervals), 5.0) if intervals else 1.0
+
+
+def _segment_from_run(
+    rider_id: str, run: list[_Candidate], duration: float, config: AnalysisConfig
+) -> SuspiciousSegment:
+    power = [item.power for item in run if item.power is not None]
+    trailing = [item for item in run if item.leader_id is not None]
+    separation = fmean(item.separation_m for item in trailing if item.separation_m is not None) if trailing else None
+    reference = fmean(item.reference_w for item in power) if power else None
+    measured = [item.frame.power_w for item in run if item.frame.power_w is not None]
+    power_score = min(1.0, fmean(item.deficit_w / item.reference_w for item in power) / 0.35) if power else 0.0
+    proximity_score = max(0.0, 1 - separation / config.proximity_threshold_m) if separation is not None else 0.0
+    duration_score = min(1.0, duration / 45)
+    speed_score = min(1.0, fmean(item.frame.speed_mps for item in run) / 15)
+    telemetry_confidence = min(0.95, 0.5 + (0.2 if power else 0) + (0.2 if trailing else 0))
+    # Heuristic review priority, not a posterior probability of drafting.
+    score = min(0.95, 0.55 + 0.14 * duration_score + 0.15 * power_score + 0.12 * proximity_score + (0.08 if power and trailing else 0))
+    notes: list[str] = []
+    if power:
+        peer_count = max(item.peer_count for item in power)
+        notes.append(
+            f"Power was lower than {peer_count} comparable sections from this rider's activity "
+            "after matching travel direction, speed, grade, and acceleration."
+        )
+        if not all(item.matched_speed for item in power):
+            notes.append("Some comparison sections required speed normalization, which increases wind uncertainty.")
+    if trailing:
+        notes.append("Synchronized GPS places this rider behind another rider for a sustained interval; GPS distance is approximate.")
+    notes.append("Wind, riding position, road surface, and sensor error can produce similar patterns.")
+    leader_ids = [item.leader_id for item in trailing if item.leader_id is not None]
+    leader = max(set(leader_ids), key=leader_ids.count) if leader_ids else None
+    distances = [item.frame.point.distance_m for item in run if item.frame.point.distance_m is not None]
+    return SuspiciousSegment(
+        rider_id=rider_id,
+        start_time=run[0].frame.point.timestamp,
+        end_time=run[-1].frame.point.timestamp,
+        score=round(score, 3),
+        evidence=Evidence(
+            proximity_score=round(proximity_score, 3),
+            duration_score=round(duration_score, 3),
+            power_score=round(power_score, 3),
+            speed_score=round(speed_score, 3),
+            telemetry_confidence=round(telemetry_confidence, 3),
+            notes=tuple(notes),
+        ),
+        nearest_rider_id=leader,
+        average_separation_m=round(separation, 1) if separation is not None else None,
+        average_speed_mps=round(fmean(item.frame.speed_mps for item in run), 2),
+        average_power_w=round(fmean(measured), 1) if measured else None,
+        expected_power_w=round(reference, 1) if reference is not None else None,
+        latitude=round(fmean(item.frame.point.latitude for item in run), 6),
+        longitude=round(fmean(item.frame.point.longitude for item in run), 6),
+        course_distance_m=round(fmean(distances), 1) if distances else None,
+    )
