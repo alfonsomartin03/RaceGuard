@@ -430,7 +430,9 @@ The current detector has two evidence paths:
    The same ahead/behind pairing must remain close for more than ten seconds before it counts.
    Sustained trailing can produce a review flag even without power. Reports label both riders
    and show each rider's speed and power alongside their mean separation. A nearby rider alongside
-   or behind the target is not treated as a drafting leader.
+   or behind the target is not treated as a drafting leader. When multiple riders are available,
+   this sustained positional relationship is weighted more strongly than power or modelled wind;
+   wind remains contextual and does not replace the synchronized GPS comparison.
 
 FIT files commonly provide timestamps, GPS, speed, distance, elevation, power, and cadence,
 but fields can be absent or recorded irregularly. When explicit gradient is unavailable,
@@ -440,6 +442,24 @@ the available record fields and irregular sampling. The power adjustment uses th
 force terms validated by [Martin et al.](https://pubmed.ncbi.nlm.nih.gov/28121252/).
 The aerodynamic plausibility check is informed by [wind-tunnel and simulation work on
 drafting](https://link.springer.com/article/10.1007/s12283-021-00345-2).
+
+The upload API enriches telemetry with hourly 10 m wind speed and direction from the
+[Open-Meteo Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api).
+It samples at most 12 route locations, batches them into one HTTP request per analysis, caches
+identical historical queries, and falls back to telemetry-only screening if weather is
+unavailable. Wind is projected onto the rider's GPS heading and used to normalize comparable
+sections by apparent air speed. Results include Open-Meteo attribution as required by CC BY 4.0.
+Apparent-air-speed normalization is used for single-rider screening. Multi-rider screening keeps
+ground-speed comparisons and treats weather as supporting context because synchronized rider
+position provides more direct evidence.
+
+RaceGuard's process-local request budget is deliberately below Open-Meteo's free-tier limits:
+500 calls/minute, 4,000/hour, and 8,000/day versus the provider limits of 600, 5,000, and
+10,000. Each sampled location is conservatively charged against RaceGuard's budget even when
+locations are sent together. The free endpoint is limited to non-commercial use. Set
+`OPEN_METEO_BASE_URL` and `OPEN_METEO_API_KEY` to use a paid customer endpoint. A deployment with
+multiple application instances must use a shared rate-limit store and an appropriate commercial
+Open-Meteo plan because an in-memory budget cannot coordinate separate processes.
 
 This is a screening heuristic, not a calibrated probability or a determination of drafting.
 Wind speed and yaw, changes in rider position, road surface, and sensor error are not resolved

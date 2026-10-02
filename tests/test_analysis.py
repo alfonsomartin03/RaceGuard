@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from raceguard.analysis import _stable_heading, analyze
@@ -74,6 +75,25 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(result.is_suspicious)
         self.assertGreaterEqual(result.confidence, 0.55)
         self.assertGreater(result.segments[0].expected_power_w, result.segments[0].average_power_w)
+
+    def test_weather_enrichment_is_reflected_in_air_speed_evidence(self) -> None:
+        profile = RiderProfile("windy", cda_m2=0.18)
+        points = [
+            replace(point, wind_speed_mps=4.0, wind_direction_deg=0.0)
+            for point in self._activity_points(profile, outlier_samples=40)
+        ]
+
+        result = analyze(points)
+
+        self.assertTrue(result.is_suspicious)
+        self.assertAlmostEqual(result.segments[0].average_headwind_mps or 0.0, 4.0, places=1)
+        self.assertGreater(
+            result.segments[0].average_air_speed_mps or 0.0,
+            result.segments[0].average_speed_mps or 0.0,
+        )
+        self.assertTrue(
+            any("Historical 10 m wind" in note for note in result.segments[0].evidence.notes)
+        )
 
     def test_coasting_at_high_speed_is_not_flagged(self) -> None:
         profile = RiderProfile("coasting", cda_m2=0.18)
@@ -231,6 +251,32 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("Rider ahead: 138", result_to_text(result))
         self.assertIn("Rider behind: 142", result_to_text(result))
         self.assertIn("Direction of travel: N", result_to_text(result))
+
+    def test_multi_rider_position_outweighs_weather_context(self) -> None:
+        baseline = analyze(load_csv("examples/sample_race.csv"))
+        baseline_segment = next(
+            segment for segment in baseline.segments if segment.rider_id == "142"
+        )
+        points = [
+            replace(
+                point,
+                wind_speed_mps=12.0,
+                wind_direction_deg=180.0 if point.rider_id == "142" else 0.0,
+            )
+            for point in load_csv("examples/sample_race.csv")
+        ]
+
+        result = analyze(points)
+        segment = next(segment for segment in result.segments if segment.rider_id == "142")
+
+        self.assertEqual(segment.score, baseline_segment.score)
+        self.assertGreater(segment.evidence.proximity_score, segment.evidence.power_score)
+        self.assertTrue(
+            any("position is weighted more strongly" in note for note in segment.evidence.notes)
+        )
+        self.assertFalse(
+            any("used to compare apparent air speed" in note for note in segment.evidence.notes)
+        )
 
     def test_heading_uses_coherent_travel_direction(self) -> None:
         started = datetime(2026, 6, 1, tzinfo=UTC)

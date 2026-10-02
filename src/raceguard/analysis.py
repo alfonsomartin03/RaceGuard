@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from itertools import pairwise
@@ -51,6 +52,8 @@ class _Frame:
     heading_deg: float | None
     power_w: float | None
     stable_pedaling: bool
+    headwind_mps: float | None
+    air_speed_mps: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +66,8 @@ class _Section:
     acceleration_mps2: float
     heading_deg: float
     power_w: float
+    headwind_mps: float | None
+    air_speed_mps: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +76,7 @@ class _PowerEvidence:
     deficit_w: float
     peer_count: int
     matched_speed: bool
+    weather_adjusted: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +128,12 @@ def analyze(
     for rider_id, frames in frames_by_rider.items():
         profile = profiles.get(rider_id, RiderProfile(rider_id))
         sections = _build_sections(frames, config)
-        comparisons = _compare_sections(sections, profile, config)
+        # Synchronized ahead/behind position is stronger than modelled hourly
+        # wind when multiple riders are available. Reserve wind-adjusted speed
+        # normalization for single-rider screening.
+        comparisons = _compare_sections(
+            sections, profile, config, use_weather=len(riders) == 1
+        )
         for section, evidence in comparisons:
             for frame in section.frames:
                 key = (rider_id, frame.point.timestamp)
@@ -226,6 +237,7 @@ def _build_frames(points: list[TelemetryPoint], config: AnalysisConfig) -> list[
         )
         transition = inactive_prefix[transition_right] != inactive_prefix[transition_left]
         window_powers = [sample.power_w for sample in window if sample.power_w is not None]
+        wind = _relative_wind(window, heading, fmean(sample.speed_mps for sample in window))
         frames.append(
             _Frame(
                 point=point,
@@ -235,9 +247,42 @@ def _build_frames(points: list[TelemetryPoint], config: AnalysisConfig) -> list[
                 heading_deg=heading,
                 power_w=fmean(window_powers) if window_powers else None,
                 stable_pedaling=not transition and point.speed_mps >= config.minimum_speed_mps,
+                headwind_mps=wind[0] if wind is not None else None,
+                air_speed_mps=wind[1] if wind is not None else None,
             )
         )
     return frames
+
+
+def _relative_wind(
+    points: list[TelemetryPoint], heading_deg: float | None, ground_speed_mps: float
+) -> tuple[float, float] | None:
+    """Return along-course headwind and apparent air speed.
+
+    Weather direction follows the meteorological convention: the direction the
+    wind comes from. Crosswind is retained in the apparent-air-speed magnitude.
+    """
+    if heading_deg is None:
+        return None
+    samples = [
+        (point.wind_speed_mps, point.wind_direction_deg)
+        for point in points
+        if point.wind_speed_mps is not None and point.wind_direction_deg is not None
+    ]
+    if not samples:
+        return None
+    headwinds = [
+        speed * math.cos(math.radians(direction - heading_deg))
+        for speed, direction in samples
+    ]
+    crosswinds = [
+        speed * math.sin(math.radians(direction - heading_deg))
+        for speed, direction in samples
+    ]
+    headwind = fmean(headwinds)
+    crosswind = fmean(crosswinds)
+    air_speed = math.hypot(max(0.0, ground_speed_mps + headwind), crosswind)
+    return headwind, air_speed
 
 
 def _derived_grade(window: list[TelemetryPoint], config: AnalysisConfig) -> float | None:
@@ -375,12 +420,19 @@ def _append_section(
                 [frame.heading_deg for frame in frames if frame.heading_deg is not None]
             ),
             power_w=fmean(frame.power_w for frame in frames if frame.power_w is not None),
+            headwind_mps=_optional_mean(frame.headwind_mps for frame in frames),
+            air_speed_mps=_optional_mean(frame.air_speed_mps for frame in frames),
         )
     )
 
 
 def _power_evidence_strength(evidence: _PowerEvidence) -> float:
     return evidence.deficit_w / max(evidence.reference_w, 1.0)
+
+
+def _optional_mean(values: Iterable[float | None]) -> float | None:
+    present = [value for value in values if value is not None]
+    return fmean(present) if present else None
 
 
 def _circular_mean(angles: list[float]) -> float:
@@ -390,7 +442,11 @@ def _circular_mean(angles: list[float]) -> float:
 
 
 def _compare_sections(
-    sections: list[_Section], profile: RiderProfile, config: AnalysisConfig
+    sections: list[_Section],
+    profile: RiderProfile,
+    config: AnalysisConfig,
+    *,
+    use_weather: bool,
 ) -> list[tuple[_Section, _PowerEvidence]]:
     matches: list[tuple[_Section, _PowerEvidence]] = []
     for section in sections:
@@ -404,19 +460,32 @@ def _compare_sections(
             and abs(section.gradient - other.gradient) <= config.similar_gradient_tolerance
             and abs(section.acceleration_mps2 - other.acceleration_mps2)
             <= config.similar_acceleration_tolerance_mps2
-            and abs(section.speed_mps - other.speed_mps) <= 3.5
+            and abs(
+                _comparison_speed(section, use_weather)
+                - _comparison_speed(other, use_weather)
+            )
+            <= 3.5
         ]
         if len(peers) < max(2, config.minimum_comparison_sections):
             continue
         same_speed = [
             peer for peer in peers
-            if abs(peer.speed_mps - section.speed_mps) <= config.similar_speed_tolerance_mps
+            if abs(
+                _comparison_speed(peer, use_weather)
+                - _comparison_speed(section, use_weather)
+            )
+            <= config.similar_speed_tolerance_mps
         ]
         selected = same_speed if len(same_speed) >= 2 else peers
         matched_speed = selected is same_speed
         references = [
             reference for peer in selected
-            if (reference := _reference_power(peer, section, profile, matched_speed)) is not None
+            if (
+                reference := _reference_power(
+                    peer, section, profile, matched_speed, use_weather=use_weather
+                )
+            )
+            is not None
         ]
         if len(references) < 2:
             continue
@@ -432,7 +501,16 @@ def _compare_sections(
         if aero_w < 50 or deficit_w > 0.7 * aero_w:
             continue
         matches.append(
-            (section, _PowerEvidence(reference_w, deficit_w, len(references), matched_speed))
+            (
+                section,
+                _PowerEvidence(
+                    reference_w,
+                    deficit_w,
+                    len(references),
+                    matched_speed,
+                    use_weather and section.air_speed_mps is not None,
+                ),
+            )
         )
     return matches
 
@@ -449,16 +527,29 @@ def _mechanical_power(section: _Section, profile: RiderProfile) -> float:
 
 
 def _reference_power(
-    peer: _Section, target: _Section, profile: RiderProfile, matched_speed: bool
+    peer: _Section,
+    target: _Section,
+    profile: RiderProfile,
+    matched_speed: bool,
+    *,
+    use_weather: bool,
 ) -> float | None:
     if matched_speed:
         return peer.power_w + _mechanical_power(target, profile) - _mechanical_power(peer, profile)
     peer_aero_w = peer.power_w - _mechanical_power(peer, profile)
     if peer_aero_w <= 0:
         return None
-    return _mechanical_power(target, profile) + peer_aero_w * (
-        target.speed_mps / peer.speed_mps
-    ) ** 3
+    peer_speed = _comparison_speed(peer, use_weather)
+    target_speed = _comparison_speed(target, use_weather)
+    if peer_speed <= 0:
+        return None
+    return _mechanical_power(target, profile) + peer_aero_w * (target_speed / peer_speed) ** 3
+
+
+def _comparison_speed(section: _Section, use_weather: bool) -> float:
+    if use_weather and section.air_speed_mps is not None:
+        return section.air_speed_mps
+    return section.speed_mps
 
 
 def _section_gap(first: _Section, second: _Section) -> float:
@@ -586,6 +677,8 @@ def _segment_from_run(
     separation = fmean(item.separation_m for item in trailing if item.separation_m is not None) if trailing else None
     reference = fmean(item.reference_w for item in power) if power else None
     measured = [item.frame.power_w for item in run if item.frame.power_w is not None]
+    headwinds = [item.frame.headwind_mps for item in run if item.frame.headwind_mps is not None]
+    air_speeds = [item.frame.air_speed_mps for item in run if item.frame.air_speed_mps is not None]
     leader_speeds = [item.leader_speed_mps for item in trailing if item.leader_speed_mps is not None]
     leader_powers = [item.leader_power_w for item in trailing if item.leader_power_w is not None]
     power_score = min(1.0, fmean(item.deficit_w / item.reference_w for item in power) / 0.35) if power else 0.0
@@ -596,8 +689,20 @@ def _segment_from_run(
     leader_ids = [item.leader_id for item in trailing if item.leader_id is not None]
     leader = max(set(leader_ids), key=leader_ids.count) if leader_ids else None
     headings = [item.frame.heading_deg for item in run if item.frame.heading_deg is not None]
-    # Heuristic review priority, not a posterior probability of drafting.
-    score = min(0.95, 0.55 + 0.14 * duration_score + 0.15 * power_score + 0.12 * proximity_score + (0.08 if power and trailing else 0))
+    # Heuristic review priority, not a posterior probability of drafting. When
+    # another rider is observed, sustained GPS relationship outweighs inferred
+    # power or weather effects.
+    if trailing:
+        score = min(
+            0.95,
+            0.55
+            + 0.18 * duration_score
+            + 0.22 * proximity_score
+            + 0.06 * power_score
+            + (0.04 if power else 0),
+        )
+    else:
+        score = min(0.95, 0.55 + 0.14 * duration_score + 0.15 * power_score)
     notes: list[str] = []
     if power:
         peer_count = max(item.peer_count for item in power)
@@ -607,12 +712,20 @@ def _segment_from_run(
         )
         if not all(item.matched_speed for item in power):
             notes.append("Some comparison sections required speed normalization, which increases wind uncertainty.")
+        if any(item.weather_adjusted for item in power):
+            notes.append(
+                "Historical 10 m wind was used to compare apparent air speed; local shelter and gusts remain unknown."
+            )
     if trailing:
         notes.append(
             f"Synchronized GPS places rider {rider_id} behind rider "
             f"{leader} "
             f"for more than {config.minimum_proximity_seconds:.0f} seconds; GPS distance is approximate."
         )
+        if air_speeds:
+            notes.append(
+                "Weather is contextual only for multi-rider screening; synchronized rider position is weighted more strongly."
+            )
     notes.append("Wind, riding position, road surface, and sensor error can produce similar patterns.")
     distances = [item.frame.point.distance_m for item in run if item.frame.point.distance_m is not None]
     return SuspiciousSegment(
@@ -642,6 +755,8 @@ def _segment_from_run(
         average_speed_mps=round(fmean(item.frame.speed_mps for item in run), 2),
         average_power_w=round(fmean(measured), 1) if measured else None,
         expected_power_w=round(reference, 1) if reference is not None else None,
+        average_headwind_mps=round(fmean(headwinds), 2) if headwinds else None,
+        average_air_speed_mps=round(fmean(air_speeds), 2) if air_speeds else None,
         latitude=round(fmean(item.frame.point.latitude for item in run), 6),
         longitude=round(fmean(item.frame.point.longitude for item in run), 6),
         course_distance_m=round(fmean(distances), 1) if distances else None,

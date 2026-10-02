@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -7,6 +8,12 @@ from raceguard.api import app
 
 class ApiTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.weather = patch(
+            "raceguard.api.enrich_points_with_weather",
+            side_effect=lambda points: (points, "Weather test fixture."),
+        )
+        self.weather.start()
+        self.addCleanup(self.weather.stop)
         self.client = TestClient(app)
 
     def test_csv_upload_returns_analysis(self) -> None:

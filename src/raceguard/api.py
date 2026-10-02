@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
+from dataclasses import replace
 from importlib.resources import files
 from pathlib import Path
 from typing import Annotated
@@ -16,6 +18,7 @@ except ImportError as exc:  # pragma: no cover - depends on optional installatio
 from .analysis import analyze
 from .ingest import TelemetryError, load_csv, load_fit
 from .reporting import result_to_dict
+from .weather import WeatherUnavailable, enrich_points_with_weather
 
 app = FastAPI(
     title="RaceGuard",
@@ -81,4 +84,12 @@ async def analyze_upload(
         finally:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-    return result_to_dict(analyze(all_points))
+    weather_warning: str
+    try:
+        all_points, weather_warning = await asyncio.to_thread(
+            enrich_points_with_weather, all_points
+        )
+    except WeatherUnavailable as exc:
+        weather_warning = f"Historical wind unavailable: {exc}."
+    result = analyze(all_points)
+    return result_to_dict(replace(result, warnings=(*result.warnings, weather_warning)))

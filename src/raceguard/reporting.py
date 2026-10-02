@@ -56,6 +56,8 @@ def result_to_text(result: AnalysisResult) -> str:
                 f"   Rider behind: {segment.rider_behind_id or segment.rider_id} | Speed: {_speed(segment.rider_behind_speed_mps or segment.average_speed_mps)} | Power: {_number(segment.rider_behind_power_w if segment.rider_behind_power_w is not None else segment.average_power_w, 'W')}",
                 f"   Distance between riders: {_number(segment.average_separation_m, 'm')}",
                 f"   Direction of travel: {_heading(segment.direction_heading_deg)}",
+                f"   Estimated headwind: {_number(segment.average_headwind_mps, 'm/s')}",
+                f"   Estimated apparent air speed: {_number(segment.average_air_speed_mps, 'm/s')}",
                 f"   Matched-section power reference: {_number(segment.expected_power_w, 'W')}",
                 f"   Location: {_location(segment.latitude, segment.longitude, segment.course_distance_m)}",
                 "   Recommendation: review footage, observations, weather, and source telemetry.",

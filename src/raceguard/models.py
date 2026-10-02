@@ -37,6 +37,8 @@ class TelemetryPoint:
     heart_rate_bpm: float | None = None
     distance_m: float | None = None
     gradient: float = 0.0
+    wind_speed_mps: float | None = None
+    wind_direction_deg: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +106,8 @@ class SuspiciousSegment:
     average_speed_mps: float | None = None
     average_power_w: float | None = None
     expected_power_w: float | None = None
+    average_headwind_mps: float | None = None
+    average_air_speed_mps: float | None = None
     latitude: float | None = None
     longitude: float | None = None
     course_distance_m: float | None = None
