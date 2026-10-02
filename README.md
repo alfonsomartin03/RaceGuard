@@ -412,41 +412,38 @@ pytest
 
 ## Working Prototype
 
-The `feature/working-prototype` branch provides an end-to-end, local prototype. It accepts
-multi-rider CSV files and individual FIT activities, validates telemetry, estimates solo
-power demand, finds sustained synchronized GPS proximity, and produces explainable review
-flags. It deliberately does not issue penalties or label a rider as having cheated.
+RaceGuard accepts CSV and FIT activities and returns locations for an official to review.
+The current detector has two evidence paths:
 
-A single FIT activity can be flagged from a sustained mismatch between measured power and
-the estimated solo power required for its speed. Multi-rider uploads add independent GPS
-proximity evidence and therefore support a higher-confidence assessment.
+1. **Within-rider power comparison.** A centered seven-second window smooths speed, power,
+   grade, and acceleration. Coasting, soft pedaling, cadence dropouts, and nearby transitions
+   are excluded. Stable ten-second sections are compared with sections from the same rider
+   at similar grade, acceleration, and travel direction, at least 30 seconds apart. Matching
+   speed is preferred. If speed differs by at most 3.5 m/s, a speed-cubed aerodynamic
+   adjustment is used with a higher threshold. The median of at least two reference sections
+   must exceed the candidate by at least 45 W and 15%, or 60 W and 20% for speed-normalized
+   comparisons. The difference must also exceed 2.5 times a robust reference spread and
+   persist for at least 15 seconds. No generic rider CdA can create a single-rider flag.
+2. **Trailing-rider GPS.** When multiple riders are uploaded, synchronized samples are checked
+   for a rider moving behind another in the same direction and within a narrow lateral band.
+   Sustained trailing can produce a review flag even without power. A nearby rider alongside
+   or behind the target is not treated as a drafting leader.
 
-For activities with at least 20 usable power samples, RaceGuard infers a robust rider-specific
-aerodynamic baseline from the file instead of assuming the default CdA. It adjusts each sample
-for gradient and rolling resistance, then uses median absolute deviation to identify sustained
-power-to-speed outliers. This keeps a consistently aerodynamic rider from being flagged simply
-for having a better position while still surfacing same-power/higher-speed anomalies. Short
-activities fall back to the configured physics profile and are reported with lower confidence.
+FIT files commonly provide timestamps, GPS, speed, distance, elevation, power, and cadence,
+but fields can be absent or recorded irregularly. When explicit gradient is unavailable,
+RaceGuard estimates it from elevation change over at least 20 meters. [Garmin's FIT Activity
+specification](https://developer.garmin.com/fit/articles/file-types/activity.html) describes
+the available record fields and irregular sampling. The power adjustment uses the cycling
+force terms validated by [Martin et al.](https://pubmed.ncbi.nlm.nih.gov/28121252/).
+The aerodynamic plausibility check is informed by [wind-tunnel and simulation work on
+drafting](https://link.springer.com/article/10.1007/s12283-021-00345-2).
 
-Telemetry is evaluated with a centered seven-second rolling window. Windows around stopped
-pedaling, soft pedaling, or the transition back onto power are excluded from power-anomaly
-evidence using power and cadence when available. A genuine power-to-speed anomaly must remain
-after smoothing and still satisfy the minimum segment duration; GPS proximity remains an
-independent source of evidence in multi-rider files.
-
-When an activity has elevation but no explicit grade—as is typical for FIT records—RaceGuard
-derives gradient from the elevation change over at least 20 meters of traveled distance. The
-power model also includes acceleration or deceleration measured across the rolling window.
-Candidates must exceed both a 45 W absolute deficit and a 15% proportional deficit, which
-prevents small sensor or model errors from being amplified merely because the rider is fast.
-
-RaceGuard also performs within-activity section matching. Stable ten-second sections are
-compared with non-adjacent earlier or later sections from the same rider when speed is within
-0.75 m/s, gradient within 0.75 percentage points, and acceleration within 0.20 m/s². The
-median power of at least two comparable sections becomes a rider-specific reference. A lower
-power section must be a robust statistical outlier, exceed the absolute and proportional
-thresholds, and persist long enough to become a review location. Repeated occurrences are
-returned as separate chronological flags. This comparison is independent of assumed CdA.
+This is a screening heuristic, not a calibrated probability or a determination of drafting.
+Wind speed and yaw, changes in rider position, road surface, and sensor error are not resolved
+by an ordinary FIT file. A short activity with no comparable riding sections produces no
+single-rider power flag. Thresholds need validation against labeled solo and drafting rides
+before operational use; see [field aerodynamics research](https://www.jsc-journal.com/index.php/JSC/article/view/168)
+for why missing wind measurements matter.
 
 ### Analyze from the command line
 
@@ -469,7 +466,7 @@ uvicorn raceguard.api:app --reload
 ```
 
 Open `http://127.0.0.1:8000`, upload telemetry, and inspect the activity assessment,
-confidence score, review locations, and contributing evidence. Up to 20 CSV/FIT activities
+evidence score, review locations, and contributing evidence. Up to 20 CSV/FIT activities
 can be selected in one submission and are analyzed together. CSV files can contain one or
 more riders; each FIT file receives an editable rider label defaulted from its filename.
 Review locations are returned chronologically so an official can follow the activity timeline.
@@ -485,16 +482,16 @@ raceguard activity.fit --rider-id 142
 
 ### Prototype limitations
 
-- Multi-rider proximity currently requires samples with matching UTC timestamps.
-- The physics model uses a constant configured wind value and does not infer wind direction.
+- Multi-rider proximity allows samples up to two seconds apart, but recording clocks must
+  represent the same real-world time.
+- Wind speed and direction are not inferred from FIT data. Weather data can be integrated
+  later using each segment's coordinates and timestamp.
 - Segment coordinates and timestamps are included in the result contract so a future weather
   provider can supply local wind speed and direction without changing the upload workflow.
 - Consumer GPS uncertainty can be similar to the distances under review.
 - Scores are heuristic review priorities and require validation against controlled trials.
 - Data is processed in memory; persistence, authentication, and race administration are not
   part of this local prototype.
-
-Initial development should focus on FIT-file parsing, trajectory reconstruction, and detecting suspicious power-to-speed relationships.
 
 ## Motivation
 

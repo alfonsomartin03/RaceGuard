@@ -19,6 +19,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(rider_142[0].longitude or 1, -74.0, places=5)
         self.assertTrue(result.is_suspicious)
         self.assertGreater(result.confidence, 0.5)
+        self.assertFalse(any(segment.rider_id == "138" for segment in result.segments))
 
     def test_reports_use_screening_language(self) -> None:
         result = analyze(load_csv("examples/sample_race.csv"))
@@ -45,31 +46,28 @@ class AnalysisTests(unittest.TestCase):
         self.assertFalse(result.is_suspicious)
         self.assertEqual(result.confidence, 0.0)
 
-    def test_single_rider_can_be_flagged_from_power_speed_anomaly(self) -> None:
+    def test_short_single_rider_file_lacks_a_comparison_baseline(self) -> None:
         points = [
             point for point in load_csv("examples/sample_race.csv") if point.rider_id == "142"
         ]
 
         result = analyze(points)
 
-        self.assertTrue(result.is_suspicious)
-        self.assertEqual(len(result.segments), 1)
-        self.assertIsNone(result.segments[0].nearest_rider_id)
-        self.assertGreaterEqual(result.confidence, 0.55)
-        self.assertIn("power-to-speed anomalies", result.warnings[0])
+        self.assertFalse(result.is_suspicious)
+        self.assertIn("repeated comparable conditions", result.warnings[0])
 
-    def test_aero_rider_is_calibrated_from_activity_baseline(self) -> None:
+    def test_fast_aero_rider_is_not_flagged_without_personal_deviation(self) -> None:
         profile = RiderProfile("aero", cda_m2=0.15)
         points = self._activity_points(profile, outlier_samples=0, baseline_speed=16.0)
 
         result = analyze(points)
 
         self.assertFalse(result.is_suspicious)
-        self.assertTrue(any("Adaptive power-to-speed" in warning for warning in result.warnings))
+        self.assertTrue(any("no sustained power anomaly" in warning for warning in result.warnings))
 
     def test_sustained_speed_outlier_is_flagged_against_rider_baseline(self) -> None:
         profile = RiderProfile("aero", cda_m2=0.18)
-        points = self._activity_points(profile, outlier_samples=16)
+        points = self._activity_points(profile, outlier_samples=40)
 
         result = analyze(points)
 
@@ -152,6 +150,73 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertFalse(result.is_suspicious)
 
+    def test_lower_power_on_a_descent_is_not_compared_with_flat_riding(self) -> None:
+        profile = RiderProfile("hill", cda_m2=0.25)
+        flat = expected_solo_power(12, 0, profile)
+        downhill = expected_solo_power(12, -0.02, profile)
+        points = self._phased_activity(
+            "hill", [(50, 12, 0, flat), (40, 12, -0.02, downhill), (50, 12, 0, flat)]
+        )
+
+        self.assertFalse(analyze(points).is_suspicious)
+
+    def test_opposite_direction_is_not_a_power_reference(self) -> None:
+        profile = RiderProfile("turnaround", cda_m2=0.25)
+        normal = expected_solo_power(12, 0, profile)
+        points = self._phased_activity(
+            "turnaround", [(60, 12, 0, normal), (40, 12, 0, normal - 100)]
+        )
+        points = [
+            TelemetryPoint(
+                rider_id=point.rider_id,
+                timestamp=point.timestamp,
+                latitude=40.006 - (index - 60) * 0.0001 if index >= 60 else point.latitude,
+                longitude=point.longitude,
+                speed_mps=point.speed_mps,
+                power_w=point.power_w,
+                cadence_rpm=point.cadence_rpm,
+                gradient=point.gradient,
+            )
+            for index, point in enumerate(points)
+        ]
+
+        self.assertFalse(analyze(points).is_suspicious)
+
+    def test_side_by_side_riders_are_not_trailing_evidence(self) -> None:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        points = [
+            TelemetryPoint(
+                rider_id=rider_id,
+                timestamp=started + timedelta(seconds=index),
+                latitude=40 + index * 0.0001,
+                longitude=-74 + longitude_offset,
+                speed_mps=12,
+                power_w=300,
+                cadence_rpm=90,
+            )
+            for index in range(40)
+            for rider_id, longitude_offset in (("a", 0.0), ("b", 0.0001))
+        ]
+
+        self.assertFalse(analyze(points).is_suspicious)
+
+    def test_trailing_gps_still_works_without_power(self) -> None:
+        points = [
+            TelemetryPoint(
+                rider_id=point.rider_id,
+                timestamp=point.timestamp,
+                latitude=point.latitude,
+                longitude=point.longitude,
+                speed_mps=point.speed_mps,
+            )
+            for point in load_csv("examples/sample_race.csv")
+        ]
+
+        result = analyze(points)
+
+        self.assertEqual([segment.rider_id for segment in result.segments], ["142"])
+        self.assertIsNone(result.segments[0].average_power_w)
+
     def test_repeated_low_power_sections_are_compared_with_similar_sections(self) -> None:
         profile = RiderProfile("repeat", cda_m2=0.25)
         normal_power = expected_solo_power(12.0, 0.01, profile)
@@ -174,7 +239,7 @@ class AnalysisTests(unittest.TestCase):
         contextual = [
             segment
             for segment in result.segments
-            if any("non-adjacent" in note for note in segment.evidence.notes)
+            if any("comparable sections" in note for note in segment.evidence.notes)
         ]
         self.assertGreaterEqual(len(contextual), 2)
         self.assertEqual(

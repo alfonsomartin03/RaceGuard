@@ -43,8 +43,6 @@ class TelemetryPoint:
 class AnalysisConfig:
     """Conservative defaults for surfacing segments for human review."""
 
-    air_density_kg_m3: float = 1.225
-    wind_speed_mps: float = 0.0
     proximity_threshold_m: float = 15.0
     minimum_segment_seconds: float = 15.0
     minimum_power_deficit_w: float = 45.0
@@ -52,8 +50,6 @@ class AnalysisConfig:
     minimum_speed_mps: float = 8.0
     maximum_sample_gap_seconds: float = 5.0
     score_threshold: float = 0.55
-    minimum_baseline_points: int = 20
-    outlier_z_threshold: float = 2.5
     rolling_window_seconds: float = 7.0
     pedaling_transition_seconds: float = 4.0
     minimum_pedaling_power_w: float = 75.0
@@ -62,6 +58,7 @@ class AnalysisConfig:
     minimum_gradient_distance_m: float = 20.0
     comparison_section_seconds: float = 10.0
     comparison_exclusion_seconds: float = 30.0
+    comparison_max_seconds: float = 1800.0
     similar_speed_tolerance_mps: float = 0.75
     similar_gradient_tolerance: float = 0.0075
     similar_acceleration_tolerance_mps2: float = 0.20
