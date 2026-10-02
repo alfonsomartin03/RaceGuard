@@ -1,9 +1,9 @@
 import unittest
 from datetime import UTC, datetime, timedelta
 
-from raceguard.analysis import analyze
+from raceguard.analysis import _stable_heading, analyze
 from raceguard.ingest import load_csv
-from raceguard.models import RiderProfile, TelemetryPoint
+from raceguard.models import AnalysisConfig, RiderProfile, TelemetryPoint
 from raceguard.physics import expected_solo_power
 from raceguard.reporting import result_to_dict, result_to_text
 
@@ -227,8 +227,44 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNotNone(segment.rider_behind_speed_mps)
         self.assertIsNotNone(segment.rider_ahead_power_w)
         self.assertIsNotNone(segment.rider_behind_power_w)
+        self.assertAlmostEqual(segment.direction_heading_deg or -1, 0.0, delta=1.0)
         self.assertIn("Rider ahead: 138", result_to_text(result))
         self.assertIn("Rider behind: 142", result_to_text(result))
+        self.assertIn("Direction of travel: N", result_to_text(result))
+
+    def test_heading_uses_coherent_travel_direction(self) -> None:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        points = [
+            TelemetryPoint(
+                rider_id="northbound",
+                timestamp=started + timedelta(seconds=index),
+                latitude=40 + index * 0.0001,
+                longitude=-74.0,
+                speed_mps=12.0,
+            )
+            for index in range(6)
+        ]
+
+        heading = _stable_heading(points, AnalysisConfig())
+
+        self.assertIsNotNone(heading)
+        self.assertAlmostEqual(heading or -1, 0.0, delta=1.0)
+
+    def test_heading_rejects_a_turnaround_as_ambiguous(self) -> None:
+        started = datetime(2026, 6, 1, tzinfo=UTC)
+        latitudes = [40.0, 40.0001, 40.0002, 40.0001, 40.0]
+        points = [
+            TelemetryPoint(
+                rider_id="turnaround",
+                timestamp=started + timedelta(seconds=index),
+                latitude=latitude,
+                longitude=-74.0,
+                speed_mps=12.0,
+            )
+            for index, latitude in enumerate(latitudes)
+        ]
+
+        self.assertIsNone(_stable_heading(points, AnalysisConfig()))
 
     def test_close_pass_under_ten_seconds_is_not_proximity_evidence(self) -> None:
         started = datetime(2026, 6, 1, tzinfo=UTC)

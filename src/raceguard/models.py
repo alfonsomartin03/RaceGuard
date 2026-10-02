@@ -50,6 +50,10 @@ class AnalysisConfig:
     minimum_power_deficit_ratio: float = 0.15
     minimum_speed_mps: float = 8.0
     maximum_sample_gap_seconds: float = 5.0
+    heading_window_seconds: float = 8.0
+    minimum_heading_displacement_m: float = 10.0
+    minimum_heading_consistency: float = 0.85
+    maximum_pair_heading_difference_deg: float = 15.0
     score_threshold: float = 0.55
     rolling_window_seconds: float = 7.0
     pedaling_transition_seconds: float = 4.0
@@ -95,6 +99,7 @@ class SuspiciousSegment:
     rider_ahead_power_w: float | None = None
     rider_behind_speed_mps: float | None = None
     rider_behind_power_w: float | None = None
+    direction_heading_deg: float | None = None
     average_speed_mps: float | None = None
     average_power_w: float | None = None
     expected_power_w: float | None = None

@@ -205,10 +205,14 @@ def _build_frames(points: list[TelemetryPoint], config: AnalysisConfig) -> list[
         derived = _derived_grade(window, config)
         if abs(grade) < 0.0001 and derived is not None:
             grade = derived
-        direction_left = bisect_left(timestamps, point.timestamp - timedelta(seconds=8))
-        direction_right = bisect_right(timestamps, point.timestamp + timedelta(seconds=8))
+        direction_left = bisect_left(
+            timestamps, point.timestamp - timedelta(seconds=config.heading_window_seconds)
+        )
+        direction_right = bisect_right(
+            timestamps, point.timestamp + timedelta(seconds=config.heading_window_seconds)
+        )
         direction_points = ordered[direction_left:direction_right]
-        heading = _bearing(direction_points[0], direction_points[-1]) if len(direction_points) > 1 else None
+        heading = _stable_heading(direction_points, config)
         transition_left = bisect_left(
             timestamps, point.timestamp - timedelta(seconds=config.pedaling_transition_seconds)
         )
@@ -252,6 +256,44 @@ def _bearing(first: TelemetryPoint, last: TelemetryPoint) -> float | None:
     if math.hypot(north, east) < 1e-9:
         return None
     return math.degrees(math.atan2(east, north)) % 360
+
+
+def _stable_heading(
+    points: list[TelemetryPoint], config: AnalysisConfig
+) -> float | None:
+    """Return a course heading only when GPS movement is coherent enough to trust.
+
+    Successive position vectors are combined instead of relying on a single pair
+    of endpoints. The resultant/path ratio rejects stationary GPS wander, sharp
+    turns, and turnarounds where an ahead/behind label would be ambiguous.
+    """
+    if len(points) < 2:
+        return None
+    north_total = 0.0
+    east_total = 0.0
+    path_distance = 0.0
+    for first, last in pairwise(points):
+        elapsed = (last.timestamp - first.timestamp).total_seconds()
+        if elapsed <= 0 or elapsed > config.maximum_sample_gap_seconds:
+            return None
+        north = math.radians(last.latitude - first.latitude) * 6_371_008.8
+        east = (
+            math.radians(last.longitude - first.longitude)
+            * 6_371_008.8
+            * math.cos(math.radians((first.latitude + last.latitude) / 2))
+        )
+        distance = math.hypot(north, east)
+        north_total += north
+        east_total += east
+        path_distance += distance
+    displacement = math.hypot(north_total, east_total)
+    if (
+        path_distance < config.minimum_heading_displacement_m
+        or displacement < config.minimum_heading_displacement_m
+        or displacement / path_distance < config.minimum_heading_consistency
+    ):
+        return None
+    return math.degrees(math.atan2(east_total, north_total)) % 360
 
 
 def _angle_difference(first: float, second: float) -> float:
@@ -410,7 +452,11 @@ def _trailing_evidence(
                     other = others[candidate_index]
                     if abs((other.point.timestamp - frame.point.timestamp).total_seconds()) > 2:
                         continue
-                    if other.heading_deg is None or _angle_difference(frame.heading_deg, other.heading_deg) > 20:
+                    if (
+                        other.heading_deg is None
+                        or _angle_difference(frame.heading_deg, other.heading_deg)
+                        > config.maximum_pair_heading_difference_deg
+                    ):
                         continue
                     if abs(frame.speed_mps - other.speed_mps) > 2:
                         continue
@@ -507,6 +553,7 @@ def _segment_from_run(
     telemetry_confidence = min(0.95, 0.5 + (0.2 if power else 0) + (0.2 if trailing else 0))
     leader_ids = [item.leader_id for item in trailing if item.leader_id is not None]
     leader = max(set(leader_ids), key=leader_ids.count) if leader_ids else None
+    headings = [item.frame.heading_deg for item in run if item.frame.heading_deg is not None]
     # Heuristic review priority, not a posterior probability of drafting.
     score = min(0.95, 0.55 + 0.14 * duration_score + 0.15 * power_score + 0.12 * proximity_score + (0.08 if power and trailing else 0))
     notes: list[str] = []
@@ -549,6 +596,7 @@ def _segment_from_run(
         rider_behind_power_w=round(
             fmean(item.frame.power_w for item in trailing if item.frame.power_w is not None), 1
         ) if any(item.frame.power_w is not None for item in trailing) else None,
+        direction_heading_deg=round(_circular_mean(headings), 1) if headings else None,
         average_speed_mps=round(fmean(item.frame.speed_mps for item in run), 2),
         average_power_w=round(fmean(measured), 1) if measured else None,
         expected_power_w=round(reference, 1) if reference is not None else None,
