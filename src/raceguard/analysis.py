@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from statistics import fmean
+from statistics import fmean, median
 
 from .ingest import haversine_m
 from .models import AnalysisConfig, Evidence, RiderProfile, SuspiciousSegment, TelemetryPoint
-from .physics import expected_solo_power
+from .physics import GRAVITY_MPS2, expected_solo_power
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +42,16 @@ class _Candidate:
     separation_m: float | None
     expected_w: float | None
     deficit_w: float
+    power_outlier_score: float
+    adaptive_baseline: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PowerBaseline:
+    profile: RiderProfile
+    residual_center_w: float = 0.0
+    residual_scale_w: float = 0.0
+    adaptive: bool = False
 
 
 def analyze(
@@ -63,6 +73,15 @@ def analyze(
             "without rider-proximity evidence."
         )
 
+    baselines = _build_power_baselines(points, profiles, config)
+    calibrated = [rider_id for rider_id, baseline in baselines.items() if baseline.adaptive]
+    if calibrated:
+        warnings.append(
+            "Adaptive power-to-speed baselines were inferred from this activity for: "
+            + ", ".join(calibrated)
+            + "."
+        )
+
     by_time: dict[datetime, list[TelemetryPoint]] = defaultdict(list)
     for point in points:
         by_time[point.timestamp].append(point)
@@ -80,7 +99,8 @@ def analyze(
                 if nearest_distance is None or distance < nearest_distance:
                     nearest_id, nearest_distance = other.rider_id, distance
 
-            profile = profiles.get(point.rider_id, RiderProfile(point.rider_id))
+            baseline = baselines[point.rider_id]
+            profile = baseline.profile
             expected = expected_solo_power(
                 point.speed_mps,
                 point.gradient,
@@ -89,15 +109,37 @@ def analyze(
                 headwind_mps=config.wind_speed_mps,
             ) if point.power_w is not None else None
             deficit = max(0.0, (expected or 0.0) - (point.power_w or 0.0))
+            outlier_z = (
+                (deficit - baseline.residual_center_w) / baseline.residual_scale_w
+                if baseline.adaptive and baseline.residual_scale_w > 0
+                else 0.0
+            )
+            power_outlier_score = (
+                min(1.0, max(0.0, outlier_z) / 4.0)
+                if baseline.adaptive
+                else min(1.0, deficit / max(config.minimum_power_deficit_w * 2, 1))
+            )
             close = nearest_distance is not None and nearest_distance <= config.proximity_threshold_m
             anomalous = (
                 expected is not None
                 and point.speed_mps >= config.minimum_speed_mps
                 and deficit >= config.minimum_power_deficit_w
+                and (
+                    not baseline.adaptive
+                    or outlier_z >= config.outlier_z_threshold
+                )
             )
             if close or anomalous:
                 candidates[(point.rider_id, nearest_id if close else None)].append(
-                    _Candidate(point, nearest_id if close else None, nearest_distance if close else None, expected, deficit)
+                    _Candidate(
+                        point,
+                        nearest_id if close else None,
+                        nearest_distance if close else None,
+                        expected,
+                        deficit,
+                        power_outlier_score,
+                        baseline.adaptive,
+                    )
                 )
 
     segments: list[SuspiciousSegment] = []
@@ -161,7 +203,7 @@ def _build_segment(
         if average_separation is not None else 0.0
     )
     duration_score = min(1.0, duration / max(config.minimum_segment_seconds * 3, 1))
-    power_score = min(1.0, average_deficit / max(config.minimum_power_deficit_w * 2, 1))
+    power_score = fmean(item.power_outlier_score for item in run)
     average_speed = fmean(item.point.speed_mps for item in run)
     speed_score = min(1.0, average_speed / 15.0)
     telemetry_confidence = 0.45 + (0.25 if separations else 0) + (0.25 if powers else 0)
@@ -180,7 +222,13 @@ def _build_segment(
     if separations:
         notes.append("Sustained rider proximity was detected from synchronized GPS samples.")
     if average_deficit >= config.minimum_power_deficit_w:
-        notes.append("Measured power was below the simplified solo-power estimate.")
+        if any(item.adaptive_baseline for item in run):
+            notes.append(
+                "Power-to-speed efficiency was a sustained outlier from this rider's "
+                "gradient-adjusted activity baseline."
+            )
+        else:
+            notes.append("Measured power was below the simplified solo-power estimate.")
     notes.append("Environmental effects and sensor error must be considered by an official.")
 
     return SuspiciousSegment(
@@ -210,3 +258,74 @@ def _build_segment(
 def _mean_optional(values: Iterable[float | None]) -> float | None:
     available = [value for value in values if value is not None]
     return round(fmean(available), 1) if available else None
+
+
+def _build_power_baselines(
+    points: list[TelemetryPoint],
+    supplied_profiles: dict[str, RiderProfile],
+    config: AnalysisConfig,
+) -> dict[str, _PowerBaseline]:
+    """Infer a rider-specific aero baseline, then measure robust residual variation.
+
+    Median CdA and median absolute deviation keep short anomalous periods from
+    redefining what is normal for the rest of the activity.
+    """
+
+    by_rider: dict[str, list[TelemetryPoint]] = defaultdict(list)
+    for point in points:
+        by_rider[point.rider_id].append(point)
+
+    baselines: dict[str, _PowerBaseline] = {}
+    for rider_id, rider_points in by_rider.items():
+        base_profile = supplied_profiles.get(rider_id, RiderProfile(rider_id))
+        inferred_cdas = [
+            cda
+            for point in rider_points
+            if (cda := _infer_cda(point, base_profile, config)) is not None
+        ]
+        if len(inferred_cdas) < config.minimum_baseline_points:
+            baselines[rider_id] = _PowerBaseline(base_profile)
+            continue
+
+        adaptive_profile = replace(base_profile, cda_m2=median(inferred_cdas))
+        residuals = [
+            expected_solo_power(
+                point.speed_mps,
+                point.gradient,
+                adaptive_profile,
+                air_density_kg_m3=config.air_density_kg_m3,
+                headwind_mps=config.wind_speed_mps,
+            )
+            - point.power_w
+            for point in rider_points
+            if point.power_w is not None and point.speed_mps >= config.minimum_speed_mps
+        ]
+        center = median(residuals)
+        mad = median(abs(value - center) for value in residuals)
+        baselines[rider_id] = _PowerBaseline(
+            profile=adaptive_profile,
+            residual_center_w=max(0.0, center),
+            residual_scale_w=max(15.0, 1.4826 * mad),
+            adaptive=True,
+        )
+    return baselines
+
+
+def _infer_cda(
+    point: TelemetryPoint,
+    profile: RiderProfile,
+    config: AnalysisConfig,
+) -> float | None:
+    if point.power_w is None or point.speed_mps < config.minimum_speed_mps:
+        return None
+    air_speed = max(0.0, point.speed_mps + config.wind_speed_mps)
+    if air_speed <= 0:
+        return None
+    wheel_power = point.power_w * profile.drivetrain_efficiency
+    rolling_w = profile.crr * profile.total_mass_kg * GRAVITY_MPS2 * point.speed_mps
+    climbing_w = profile.total_mass_kg * GRAVITY_MPS2 * point.gradient * point.speed_mps
+    aerodynamic_w = wheel_power - rolling_w - climbing_w
+    if aerodynamic_w <= 0:
+        return None
+    inferred = 2 * aerodynamic_w / (config.air_density_kg_m3 * air_speed**3)
+    return inferred if 0.08 <= inferred <= 0.8 else None

@@ -51,6 +51,8 @@ class AnalysisConfig:
     minimum_speed_mps: float = 8.0
     maximum_sample_gap_seconds: float = 5.0
     score_threshold: float = 0.55
+    minimum_baseline_points: int = 20
+    outlier_z_threshold: float = 2.5
 
 
 @dataclass(frozen=True, slots=True)

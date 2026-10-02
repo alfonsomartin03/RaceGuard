@@ -1,7 +1,10 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from raceguard.analysis import analyze
 from raceguard.ingest import load_csv
+from raceguard.models import RiderProfile, TelemetryPoint
+from raceguard.physics import expected_solo_power
 from raceguard.reporting import result_to_dict, result_to_text
 
 
@@ -48,6 +51,57 @@ class AnalysisTests(unittest.TestCase):
         self.assertIsNone(result.segments[0].nearest_rider_id)
         self.assertGreaterEqual(result.confidence, 0.55)
         self.assertIn("power-to-speed anomalies", result.warnings[0])
+
+    def test_aero_rider_is_calibrated_from_activity_baseline(self) -> None:
+        profile = RiderProfile("aero", cda_m2=0.18)
+        points = self._activity_points(profile, outlier_samples=0)
+
+        result = analyze(points)
+
+        self.assertFalse(result.is_suspicious)
+        self.assertTrue(any("Adaptive power-to-speed" in warning for warning in result.warnings))
+
+    def test_sustained_speed_outlier_is_flagged_against_rider_baseline(self) -> None:
+        profile = RiderProfile("aero", cda_m2=0.18)
+        points = self._activity_points(profile, outlier_samples=16)
+
+        result = analyze(points)
+
+        self.assertTrue(result.is_suspicious)
+        self.assertGreaterEqual(result.confidence, 0.55)
+        self.assertGreater(result.segments[0].expected_power_w, result.segments[0].average_power_w)
+
+    @staticmethod
+    def _activity_points(profile: RiderProfile, outlier_samples: int) -> list[TelemetryPoint]:
+        started = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        baseline_samples = 60
+        baseline_speed = 12.0
+        baseline_power = expected_solo_power(baseline_speed, 0.01, profile)
+        points = [
+            TelemetryPoint(
+                rider_id=profile.rider_id,
+                timestamp=started + timedelta(seconds=index),
+                latitude=40.0 + index * 0.0001,
+                longitude=-74.0,
+                speed_mps=baseline_speed,
+                power_w=baseline_power,
+                gradient=0.01,
+            )
+            for index in range(baseline_samples)
+        ]
+        points.extend(
+            TelemetryPoint(
+                rider_id=profile.rider_id,
+                timestamp=started + timedelta(seconds=baseline_samples + index),
+                latitude=40.006 + index * 0.0001,
+                longitude=-74.0,
+                speed_mps=15.0,
+                power_w=baseline_power,
+                gradient=0.01,
+            )
+            for index in range(outlier_samples)
+        )
+        return points
 
 
 if __name__ == "__main__":

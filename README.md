@@ -421,6 +421,13 @@ A single FIT activity can be flagged from a sustained mismatch between measured 
 the estimated solo power required for its speed. Multi-rider uploads add independent GPS
 proximity evidence and therefore support a higher-confidence assessment.
 
+For activities with at least 20 usable power samples, RaceGuard infers a robust rider-specific
+aerodynamic baseline from the file instead of assuming the default CdA. It adjusts each sample
+for gradient and rolling resistance, then uses median absolute deviation to identify sustained
+power-to-speed outliers. This keeps a consistently aerodynamic rider from being flagged simply
+for having a better position while still surfacing same-power/higher-speed anomalies. Short
+activities fall back to the configured physics profile and are reported with lower confidence.
+
 ### Analyze from the command line
 
 The included sample contains two nearby riders and can be run without third-party packages:
