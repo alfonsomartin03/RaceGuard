@@ -461,8 +461,10 @@ uvicorn raceguard.api:app --reload
 ```
 
 Open `http://127.0.0.1:8000`, upload telemetry, and inspect the activity assessment,
-confidence score, review locations, and contributing evidence. CSV files can contain one or
-more riders. FIT files are analyzed as a single rider and the console prompts for a rider ID.
+confidence score, review locations, and contributing evidence. Up to 20 CSV/FIT activities
+can be selected in one submission and are analyzed together. CSV files can contain one or
+more riders; each FIT file receives an editable rider label defaulted from its filename.
+Review locations are returned chronologically so an official can follow the activity timeline.
 Uploaded files are processed locally in a temporary file and are deleted after analysis.
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
 

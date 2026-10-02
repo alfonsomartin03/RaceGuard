@@ -66,11 +66,12 @@
     .upload-icon { width: 52px; height: 52px; margin: 0 auto 14px; display: grid; place-items: center; border-radius: 15px; color: var(--lime); background: var(--lime-soft); font-size: 1.4rem; }
     .file-zone strong { display: block; font-size: 1.05rem; }
     .file-zone small { display: block; margin-top: 5px; color: var(--muted); }
-    .selected-file { margin-top: 12px; color: var(--lime); font-size: .9rem; font-weight: 700; overflow-wrap: anywhere; }
+    .selected-file { display: grid; gap: 5px; margin-top: 12px; color: var(--lime); font-size: .9rem; font-weight: 700; overflow-wrap: anywhere; }
 
     .fit-fields { margin-top: 20px; }
     .fit-fields label { display: block; margin-bottom: 7px; font-weight: 750; }
     .fit-fields p { margin: 7px 0 0; }
+    .rider-field { margin-top: 14px; }
     input[type="text"] { width: 100%; padding: 13px 14px; color: var(--text); background: #0b1512; border: 1px solid var(--border); border-radius: 11px; }
     input[type="text"]:focus { border-color: var(--lime); }
 
@@ -174,22 +175,18 @@
       <form class="panel upload-panel" id="upload">
         <div class="panel-heading">
           <span class="step">1</span>
-          <div><h2>Select an activity</h2><div class="subtle">FIT for one rider, or CSV for one or more riders.</div></div>
+          <div><h2>Select activities</h2><div class="subtle">Choose one or more FIT/CSV files to analyze together.</div></div>
         </div>
 
         <label class="file-zone" id="file-zone" for="file">
-          <input id="file" name="file" type="file" accept=".csv,.fit" required>
+          <input id="file" name="file" type="file" accept=".csv,.fit" multiple required>
           <span class="upload-icon" aria-hidden="true">↑</span>
-          <strong>Drop your file here or choose a file</strong>
-          <small>.FIT or .CSV · up to 25 MB</small>
+          <strong>Drop files here or choose activities</strong>
+          <small>.FIT or .CSV · up to 20 files · 25 MB each</small>
           <span class="selected-file" id="selected-file" hidden></span>
         </label>
 
-        <div class="fit-fields" id="fit-fields" hidden>
-          <label for="rider-id">Rider ID</label>
-          <input id="rider-id" name="rider_id" type="text" autocomplete="off" placeholder="Bib number or another label, e.g. 142">
-          <p class="subtle">This is only a label for the report. Use the rider’s bib number if available.</p>
-        </div>
+        <div class="fit-fields" id="fit-fields" hidden></div>
 
         <div class="action-row">
           <button class="primary" id="submit" type="submit">Analyze activity</button>
@@ -200,7 +197,7 @@
       <aside class="panel guide" aria-label="How RaceGuard works">
         <h2>What happens next</h2>
         <div class="guide-list">
-          <div class="guide-item"><span>1</span><div><strong>Telemetry is validated</strong><p>GPS, speed, time, and available power data are checked.</p></div></div>
+          <div class="guide-item"><span>1</span><div><strong>Activities are combined</strong><p>One or more files are validated and aligned by timestamp.</p></div></div>
           <div class="guide-item"><span>2</span><div><strong>Physics are compared</strong><p>Sustained power-to-speed anomalies are scored.</p></div></div>
           <div class="guide-item"><span>3</span><div><strong>Review points appear</strong><p>See confidence, time, location, and supporting evidence.</p></div></div>
         </div>
@@ -227,7 +224,7 @@
         <p class="disclaimer">This score is a linear 0–100 representation of the available evidence. It is a screening aid, not the probability that a violation occurred.</p>
       </article>
       <div class="warnings" id="warnings"></div>
-      <div class="section-title"><h2>Review locations</h2><span>Ordered by strongest evidence</span></div>
+      <div class="section-title"><h2>Review locations</h2><span>Ordered chronologically</span></div>
       <div id="segments"></div>
     </section>
   </main>
@@ -237,7 +234,6 @@
     const fileInput = document.querySelector('#file');
     const fileZone = document.querySelector('#file-zone');
     const selectedFile = document.querySelector('#selected-file');
-    const rider = document.querySelector('#rider-id');
     const fitFields = document.querySelector('#fit-fields');
     const submit = document.querySelector('#submit');
     const status = document.querySelector('#status');
@@ -254,11 +250,10 @@
     fileZone.addEventListener('drop', event => {
       event.preventDefault();
       fileZone.classList.remove('dragging');
-      const droppedFile = event.dataTransfer.files[0];
-      if (!droppedFile) return;
-      const extension = droppedFile.name.toLowerCase().split('.').pop();
-      if (!['fit', 'csv'].includes(extension)) {
-        status.textContent = 'Choose a .FIT or .CSV activity file.';
+      const droppedFiles = [...event.dataTransfer.files];
+      if (!droppedFiles.length) return;
+      if (droppedFiles.some(item => !['fit', 'csv'].includes(item.name.toLowerCase().split('.').pop()))) {
+        status.textContent = 'Every activity must be a .FIT or .CSV file.';
         status.classList.add('error');
         return;
       }
@@ -267,12 +262,15 @@
     });
 
     function updateFileState() {
-      const chosen = fileInput.files[0];
-      const isFit = chosen?.name.toLowerCase().endsWith('.fit');
-      fitFields.hidden = !isFit;
-      rider.required = Boolean(isFit);
-      selectedFile.hidden = !chosen;
-      selectedFile.textContent = chosen ? `Selected: ${chosen.name} · ${formatBytes(chosen.size)}` : '';
+      const chosen = [...fileInput.files];
+      const fitFiles = chosen.filter(item => item.name.toLowerCase().endsWith('.fit'));
+      selectedFile.hidden = !chosen.length;
+      selectedFile.innerHTML = chosen.map(item => `<span>${escapeHtml(item.name)} · ${formatBytes(item.size)}</span>`).join('');
+      fitFields.hidden = !fitFiles.length;
+      fitFields.innerHTML = fitFiles.length ? `<strong>Rider labels</strong><p class="subtle">Use bib numbers when available. Filename-based labels are filled in automatically.</p>${fitFiles.map((item, index) => {
+        const fallback = item.name.replace(/\.fit$/i, '') || `rider-${index + 1}`;
+        return `<div class="rider-field"><label for="rider-id-${index}">${escapeHtml(item.name)}</label><input id="rider-id-${index}" name="rider_ids" type="text" autocomplete="off" value="${escapeHtml(fallback)}" required></div>`;
+      }).join('')}` : '';
       clearStatus();
     }
 
@@ -284,7 +282,6 @@
       submit.textContent = 'Analyzing…';
       try {
         const body = new FormData(form);
-        if (fitFields.hidden) body.delete('rider_id');
         const response = await fetch('/api/analyze', { method: 'POST', body });
         const data = await response.json();
         if (!response.ok) throw new Error(data.detail || 'The activity could not be analyzed.');

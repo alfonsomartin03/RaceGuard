@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 from importlib.resources import files
 from pathlib import Path
+from typing import Annotated
 
 try:
     from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -35,30 +36,45 @@ def dashboard() -> str:
 
 @app.post("/api/analyze")
 async def analyze_upload(
-    file: UploadFile = File(...), rider_id: str | None = Form(default=None)
+    uploads: Annotated[list[UploadFile], File(alias="file")],
+    rider_ids: Annotated[list[str] | None, Form()] = None,
+    rider_id: Annotated[str | None, Form()] = None,
 ) -> dict:
-    suffix = Path(file.filename or "telemetry.csv").suffix.lower()
-    if suffix not in {".csv", ".fit"}:
-        raise HTTPException(400, "Upload a .csv or .fit file")
-    content = await file.read()
-    if not content:
-        raise HTTPException(400, "The uploaded file is empty")
-    if len(content) > 25 * 1024 * 1024:
-        raise HTTPException(413, "File exceeds the 25 MB prototype limit")
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
-            temporary.write(content)
-            temporary_path = Path(temporary.name)
-        if suffix == ".fit":
-            if not rider_id:
-                raise TelemetryError("rider_id is required for FIT input")
-            points = load_fit(temporary_path, rider_id)
-        else:
-            points = load_csv(temporary_path)
-        return result_to_dict(analyze(points))
-    except TelemetryError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+    if len(uploads) > 20:
+        raise HTTPException(400, "Upload no more than 20 activity files at once")
+    supplied_ids = rider_ids or ([rider_id] if rider_id else [])
+    fit_index = 0
+    all_points = []
+    for upload in uploads:
+        filename = upload.filename or "telemetry.csv"
+        suffix = Path(filename).suffix.lower()
+        if suffix not in {".csv", ".fit"}:
+            raise HTTPException(400, f"{filename}: upload a .csv or .fit file")
+        content = await upload.read()
+        if not content:
+            raise HTTPException(400, f"{filename}: the uploaded file is empty")
+        if len(content) > 25 * 1024 * 1024:
+            raise HTTPException(413, f"{filename}: file exceeds the 25 MB limit")
+
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temporary:
+                temporary.write(content)
+                temporary_path = Path(temporary.name)
+            if suffix == ".fit":
+                fallback_id = Path(filename).stem or f"rider-{fit_index + 1}"
+                fit_rider_id = (
+                    supplied_ids[fit_index].strip()
+                    if fit_index < len(supplied_ids) and supplied_ids[fit_index].strip()
+                    else fallback_id
+                )
+                all_points.extend(load_fit(temporary_path, fit_rider_id))
+                fit_index += 1
+            else:
+                all_points.extend(load_csv(temporary_path))
+        except TelemetryError as exc:
+            raise HTTPException(422, f"{filename}: {exc}") from exc
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+    return result_to_dict(analyze(all_points))

@@ -32,6 +32,12 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn("latitude", payload["segments"][0])
         self.assertIn("Location:", result_to_text(result))
 
+    def test_review_locations_are_chronological(self) -> None:
+        result = analyze(load_csv("examples/sample_race.csv"))
+        starts = [segment.start_time for segment in result.segments]
+
+        self.assertEqual(starts, sorted(starts))
+
     def test_empty_input_is_safe(self) -> None:
         result = analyze([])
         self.assertEqual(result.segments, ())

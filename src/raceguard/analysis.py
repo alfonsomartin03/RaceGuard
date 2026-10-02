@@ -173,7 +173,7 @@ def analyze(
         riders_analyzed=riders,
         started_at=min(point.timestamp for point in points),
         ended_at=max(point.timestamp for point in points),
-        segments=tuple(sorted(segments, key=lambda segment: (-segment.score, segment.start_time))),
+        segments=tuple(sorted(segments, key=lambda segment: (segment.start_time, segment.rider_id))),
         warnings=tuple(warnings),
     )
 
