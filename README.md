@@ -395,7 +395,75 @@ This project could investigate:
 
 ## Project Status
 
-**Status:** Planning / Research
+**Status:** Foundational backbone implemented; working prototype in active development.
+
+The core package establishes typed telemetry, rider, evidence, and analysis models plus
+an auditable cycling-physics function. The implementation intentionally keeps screening
+results separate from adjudication: every result is phrased as a review recommendation.
+
+### Development setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev,api,fit]'
+pytest
+```
+
+## Working Prototype
+
+The `feature/working-prototype` branch provides an end-to-end, local prototype. It accepts
+multi-rider CSV files and individual FIT activities, validates telemetry, estimates solo
+power demand, finds sustained synchronized GPS proximity, and produces explainable review
+flags. It deliberately does not issue penalties or label a rider as having cheated.
+
+A single FIT activity can be flagged from a sustained mismatch between measured power and
+the estimated solo power required for its speed. Multi-rider uploads add independent GPS
+proximity evidence and therefore support a higher-confidence assessment.
+
+### Analyze from the command line
+
+The included sample contains two nearby riders and can be run without third-party packages:
+
+```bash
+PYTHONPATH=src python -m raceguard.cli examples/sample_race.csv
+PYTHONPATH=src python -m raceguard.cli examples/sample_race.csv --json --output report.json
+```
+
+CSV columns are `rider_id`, ISO-8601 `timestamp`, `latitude`, `longitude`, and either
+`speed_mps` or `speed_kph`. Optional columns are `power_w`, `elevation_m`, `cadence_rpm`,
+`heart_rate_bpm`, `distance_m`, and decimal `gradient` (for example, `0.05` for 5%).
+
+### Run the review console
+
+```bash
+python -m pip install -e '.[api]'
+uvicorn raceguard.api:app --reload
+```
+
+Open `http://127.0.0.1:8000`, upload telemetry, and inspect the activity assessment,
+confidence score, review locations, and contributing evidence. CSV files can contain one or
+more riders. FIT files are analyzed as a single rider and the console prompts for a rider ID.
+Uploaded files are processed locally in a temporary file and are deleted after analysis.
+Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
+
+FIT input requires the optional dependency and a rider identifier:
+
+```bash
+python -m pip install -e '.[fit]'
+raceguard activity.fit --rider-id 142
+```
+
+### Prototype limitations
+
+- Multi-rider proximity currently requires samples with matching UTC timestamps.
+- The physics model uses a constant configured wind value and does not infer wind direction.
+- Segment coordinates and timestamps are included in the result contract so a future weather
+  provider can supply local wind speed and direction without changing the upload workflow.
+- Consumer GPS uncertainty can be similar to the distances under review.
+- Scores are heuristic review priorities and require validation against controlled trials.
+- Data is processed in memory; persistence, authentication, and race administration are not
+  part of this local prototype.
 
 Initial development should focus on FIT-file parsing, trajectory reconstruction, and detecting suspicious power-to-speed relationships.
 
